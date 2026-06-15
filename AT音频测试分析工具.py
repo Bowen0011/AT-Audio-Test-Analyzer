@@ -89,10 +89,15 @@ def iter_records(filepath):
     lines = text.split("\n")
 
     header_cols = None
-    for line in lines:
+    limits_lo = []  # Row 0: upper spec limits (from col 8)
+    limits_hi = []  # Row 1: lower spec limits (from col 8)
+    for i, line in enumerate(lines):
+        if i == 0:
+            limits_lo = line.strip().split("\t")
+        elif i == 1:
+            limits_hi = line.strip().split("\t")
         if line.startswith("SN\t") or line.startswith("SN\r"):
             header_cols = line.strip().split("\t")
-            break
     if header_cols is None:
         raise ValueError(f"未找到表头: {filepath}")
 
@@ -121,6 +126,8 @@ def iter_records(filepath):
                 "file_source": station_name,
                 "file_path": filepath,
                 "header_cols": header_cols,
+                "_limits_lo": limits_lo,
+                "_limits_hi": limits_hi,
                 "_fields_raw": fields,
             }
             # SPA values (line +5)
@@ -279,8 +286,8 @@ def analyze(records):
 
 
 def analyze_failure_reasons(records, analysis):
-    """失败原因透视分析 — 从测量数据反推失败模式
-    返回: {categories: [{name, count, pct, detail}], by_station: {station: [{reason, count}]}}
+    """失败原因分析 — 逐项对比测量值与规格限，定位超限测试项
+    返回: {categories: [{name, count, pct, detail}], by_station: ...}
     """
     failed = [r for r in records if r["result"] != "PASS" and r["result"]]
     if not failed:
@@ -288,114 +295,103 @@ def analyze_failure_reasons(records, analysis):
 
     reasons = defaultdict(lambda: {"count": 0, "sns": [], "stations": set()})
 
-    # ── 节拍异常 ──
-    all_ct = []
-    for r in records:
-        try: all_ct.append(float(r["cycle_time"]))
-        except: pass
-    if all_ct:
-        ct_avg = sum(all_ct) / len(all_ct)
-        ct_std = (sum((x - ct_avg) ** 2 for x in all_ct) / len(all_ct)) ** 0.5
-        ct_upper = ct_avg + 3 * ct_std
-        ct_lower = ct_avg - 3 * ct_std
-        for r in failed:
+    for r in failed:
+        matched = False
+        limits_lo = r.get("_limits_lo", [])
+        limits_hi = r.get("_limits_hi", [])
+        header = r.get("header_cols", [])
+
+        # ── SPA 值超限 (cols 10-13, 格式 "<lower,upper>") ──
+        spas = r.get("spa_values", [])
+        if len(spas) >= 5:
+            for ch in range(1, 5):
+                v_str = spas[ch] if ch < len(spas) else ""
+                if not v_str:
+                    continue
+                try:
+                    v = float(v_str)
+                    col_idx = 9 + ch  # cols 10-13
+                    limit_str = limits_lo[col_idx] if col_idx < len(limits_lo) else ""
+                    if limit_str.startswith("<") and "," in limit_str:
+                        parts = limit_str.strip("<>").split(",")
+                        lo = float(parts[0]) if parts[0] else 0
+                        hi = float(parts[1]) if parts[1] else float("inf")
+                        if v < lo or v > hi:
+                            name = f"SPA-CH{ch}超限({header[col_idx][:12] if col_idx < len(header) else ''})"
+                            reasons[name]["count"] += 1
+                            reasons[name]["sns"].append(r["sn"])
+                            reasons[name]["stations"].add(r["file_source"])
+                            matched = True
+                except Exception:
+                    pass
+
+        # ── 频率扫描值超限 (cols 14+ ) ──
+        sweep = r.get("freq_sweep", [])
+        if sweep:
+            category_violations = defaultdict(int)
+            for idx, s in enumerate(sweep):
+                col_idx = idx + 14  # freq sweep starts at col 14 (0-indexed = index 0->col14)
+                if col_idx >= len(limits_lo) or col_idx >= len(limits_hi):
+                    break
+                lo_str = limits_lo[col_idx].strip()
+                hi_str = limits_hi[col_idx].strip()
+                if not lo_str or not hi_str:
+                    continue
+                try:
+                    lo_v = float(lo_str)
+                    hi_v = float(hi_str)
+                    v = float(s)
+                    lower = min(lo_v, hi_v)
+                    upper = max(lo_v, hi_v)
+                    if v < lower or v > upper:
+                        # Categorize by header name
+                        hdr_name = header[col_idx] if col_idx < len(header) else f"Col{col_idx}"
+                        # Extract category: "左主1标压_FR_Left_200" → "FR"
+                        if "FR_" in hdr_name:
+                            cat = "FR超限"
+                        elif "THD_" in hdr_name:
+                            cat = "THD超限"
+                        elif "Rub&Buzz" in hdr_name:
+                            cat = "R&B超限"
+                        elif "气密性" in hdr_name:
+                            cat = "气密性超限"
+                        elif "MIC" in hdr_name:
+                            cat = "MIC超限"
+                        else:
+                            cat = "频扫超限"
+                        category_violations[cat] += 1
+                except Exception:
+                    pass
+
+            for cat, cnt in category_violations.items():
+                if cnt > 0:
+                    reasons[cat]["count"] += 1
+                    reasons[cat]["sns"].append(r["sn"])
+                    reasons[cat]["stations"].add(r["file_source"])
+                    matched = True
+
+        # ── 电量管控 col 8 ──
+        col8 = r["_fields_raw"][8].strip() if len(r["_fields_raw"]) > 8 else ""
+        if col8:
             try:
-                ct = float(r["cycle_time"])
-                if ct > ct_upper:
-                    reasons["节拍异常(过长)"]["count"] += 1
-                    reasons["节拍异常(过长)"]["sns"].append(r["sn"])
-                    reasons["节拍异常(过长)"]["stations"].add(r["file_source"])
-                elif ct < ct_lower:
-                    reasons["节拍异常(过短)"]["count"] += 1
-                    reasons["节拍异常(过短)"]["sns"].append(r["sn"])
-                    reasons["节拍异常(过短)"]["stations"].add(r["file_source"])
-            except: pass
+                v8 = float(col8)
+                limit8 = limits_lo[8] if len(limits_lo) > 8 else ""
+                if limit8.startswith("<") and "," in limit8:
+                    parts = limit8.strip("<>").split(",")
+                    lo, hi = float(parts[0]), float(parts[1])
+                    if v8 < lo or v8 > hi:
+                        reasons["电量管控超限"]["count"] += 1
+                        reasons["电量管控超限"]["sns"].append(r["sn"])
+                        reasons["电量管控超限"]["stations"].add(r["file_source"])
+                        matched = True
+            except Exception:
+                pass
 
-    # ── SPA 值偏差（>2σ from pass mean）──
-    passed = [r for r in records if r["result"] == "PASS"]
-    spa_pool = [[] for _ in range(4)]
-    for r in passed:
-        spas = r.get("spa_values", [])
-        if len(spas) >= 5:
-            for i in range(1, 5):
-                try:
-                    if spas[i]: spa_pool[i - 1].append(float(spas[i]))
-                except: pass
+        if not matched:
+            reasons["其他原因(ErrorCode空)"]["count"] += 1
+            reasons["其他原因(ErrorCode空)"]["sns"].append(r["sn"])
+            reasons["其他原因(ErrorCode空)"]["stations"].add(r["file_source"])
 
-    spa_stats = []
-    for ch_vals in spa_pool:
-        if ch_vals:
-            avg = sum(ch_vals) / len(ch_vals)
-            std = (sum((x - avg) ** 2 for x in ch_vals) / len(ch_vals)) ** 0.5
-            spa_stats.append((avg, std))
-        else:
-            spa_stats.append((0, 1))
-
-    for r in failed:
-        spas = r.get("spa_values", [])
-        if len(spas) >= 5:
-            for i in range(1, 5):
-                try:
-                    if spas[i] and i - 1 < len(spa_stats):
-                        v = float(spas[i])
-                        avg, std = spa_stats[i - 1]
-                        if abs(v - avg) > 2.5 * std:
-                            label = f"SPA-Ch{i}偏差"
-                            reasons[label]["count"] += 1
-                            reasons[label]["sns"].append(r["sn"])
-                            reasons[label]["stations"].add(r["file_source"])
-                except: pass
-
-    # ── 跨站重复失败 ──
-    for sn_info in analysis.get("multi_fail_sns", []):
-        if sn_info["fail_count"] >= 3:
-            reasons["跨站重复(≥3站)"]["count"] += 1
-            reasons["跨站重复(≥3站)"]["sns"].append(sn_info["sn"])
-            for st in sn_info["stations_failed"]:
-                reasons["跨站重复(≥3站)"]["stations"].add(st)
-        elif sn_info["fail_count"] == 2:
-            reasons["跨站重复(2站)"]["count"] += sn_info["fail_count"]
-            reasons["跨站重复(2站)"]["sns"].append(sn_info["sn"])
-            for st in sn_info["stations_failed"]:
-                reasons["跨站重复(2站)"]["stations"].add(st)
-
-    # ── 时段聚集 ──
-    fail_by_hour = defaultdict(int)
-    total_by_hour = defaultdict(int)
-    for r in records:
-        try:
-            h = r["date"][8:10]
-            total_by_hour[h] += 1
-            if r["result"] != "PASS" and r["result"]:
-                fail_by_hour[h] += 1
-        except: pass
-
-    for h, cnt in fail_by_hour.items():
-        total_h = total_by_hour[h]
-        rate = cnt / total_h * 100 if total_h else 0
-        if rate > 15:  # 时段不良率 > 15%
-            label = f"时段聚集({h}:00)"
-            reasons[label]["count"] += cnt
-            reasons[label]["stations"].add("ALL")
-
-    # ── 站别集中 ──
-    for st, d in analysis["by_station"].items():
-        rate = d["fail"] / d["total"] * 100 if d["total"] else 0
-        if rate > 15:
-            reasons[f"站别集中({st})"]["count"] += d["fail"]
-            reasons[f"站别集中({st})"]["stations"].add(st)
-
-    # ── 无法归类 ──
-    classified_sns = set()
-    for r_data in reasons.values():
-        classified_sns.update(r_data["sns"])
-    for r in failed:
-        if r["sn"] not in classified_sns:
-            reasons["常规测试波动"]["count"] += 1
-            reasons["常规测试波动"]["sns"].append(r["sn"])
-            reasons["常规测试波动"]["stations"].add(r["file_source"])
-
-    # Build categorized output
     categories = []
     for name, data in sorted(reasons.items(), key=lambda x: -x[1]["count"]):
         categories.append({
@@ -406,12 +402,10 @@ def analyze_failure_reasons(records, analysis):
             "sns": data["sns"][:10],
         })
 
-    # By station breakdown
     by_station_reasons = defaultdict(lambda: defaultdict(int))
     for name, data in reasons.items():
         for st in data["stations"]:
-            if st != "ALL":
-                by_station_reasons[st][name] += data["count"]
+            by_station_reasons[st][name] += data["count"]
 
     return {
         "categories": categories,
