@@ -518,7 +518,17 @@ def _run_gui():
                 self.records = recs
                 self.root.after(0, lambda: self.prog.set(40))
                 sinfo = " ".join(f"{st}({cnt})" for st,cnt in sorted(st_files.items()))
-                self.root.after(0, lambda: self.status.set(f"解析 {len(recs)}行 | 站别文件: {sinfo} | 按SN去重..."))
+                n_stations = len(st_files)
+                warn_msg = ""
+                if n_stations < 6:
+                    missing = [f"AT0{i}" for i in range(1,8) if f"AT0{i}" not in st_files]
+                    warn_msg = f" ⚠️ 仅检测到{n_stations}个站别，缺少: {', '.join(missing)}"
+                self.root.after(0, lambda: self.status.set(f"解析 {len(recs)}行 | 站别: {sinfo}{warn_msg}"))
+                if n_stations < 6:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", f"仅检测到 {n_stations} 个站别，请检查数据源是否完整。\n缺少: {', '.join(missing)}"))
+                if skipped:
+                    sk = "; ".join(skipped[:5])
+                    self.root.after(0, lambda: self.status.set(f"{self.status.get()} | 跳过: {sk}"))
                 a = analyze(recs); self.analysis = a
                 self.root.after(0, lambda: self.prog.set(60))
                 self.root.after(0, lambda: self._show(a))
