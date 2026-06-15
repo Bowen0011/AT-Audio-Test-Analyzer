@@ -41,18 +41,10 @@ def _get_font():
     plt.rcParams["axes.unicode_minus"] = False
     return _font
 
-def _detect_enc(fp):
-    for e in _ENCS:
-        try:
-            with open(fp,"rb") as f:
-                if "SN" in f.read(4096).decode(e,errors="replace"): return e
-        except: continue
-    return "gbk"
-
 # ═══════════════════════════════════════════════
 # 解析器
 # ═══════════════════════════════════════════════
-def _detect_station(filepath):
+def _detect_station_from_path(filepath):
     """从文件路径中提取站别名(ATxx)，向上逐级查找"""
     p = Path(filepath)
     for parent in [p] + list(p.parents):
@@ -61,12 +53,18 @@ def _detect_station(filepath):
             return name
     return os.path.basename(os.path.dirname(filepath))  # fallback
 
-# 列映射: Time[0] SN[1] TestChNum[2] TestName[3] Unit[4] Result[5] Channel[6] Value[7]...
-def parse_file(filepath):
-    enc = _detect_enc(filepath)
-    station = _detect_station(filepath)
+def _detect_enc_from_bytes(raw):
+    """从原始字节检测编码"""
+    for e in _ENCS:
+        try:
+            if "SN" in raw[:8192].decode(e, errors="replace"): return e
+        except: continue
+    return "gbk"
 
-    with open(filepath,"rb") as f: raw = f.read()
+# 列映射: Time[0] SN[1] TestChNum[2] TestName[3] Unit[4] Result[5] Channel[6] Value[7]...
+def parse_bytes(raw, station):
+    """从原始字节解析记录，需要传入已知的站别名"""
+    enc = _detect_enc_from_bytes(raw)
     text = raw.decode(enc, errors="replace")
     records = []
     for line in text.split("\n"):
@@ -76,8 +74,8 @@ def parse_file(filepath):
         if len(flds) < 8: continue
         time_str = flds[0].strip()
         sn = flds[1].strip().strip("'\"")
-        test_ch = flds[2].strip()    # 测试通道描述: "右主2气密性"
-        test_name = flds[3].strip()  # 子类型: PA/FR/THD/Rub&Buzz
+        test_ch = flds[2].strip()
+        test_name = flds[3].strip()
         result = flds[5].strip()
         if not result or result not in ("Pass","Fail","pass","fail"): continue
 
@@ -99,29 +97,49 @@ def parse_file(filepath):
 
 def parse_source(src, cb=None):
     all_recs = []; skipped = []; station_files = defaultdict(int)
-    def _process(fp):
+
+    def _add_file(station, raw):
+        """处理单个文件的内存数据"""
+        station_files[station] += 1
         try:
-            st = _detect_station(fp)
-            station_files[st] += 1
-            all_recs.extend(parse_file(fp))
+            recs = parse_bytes(raw, station)
+            all_recs.extend(recs)
+        except Exception as e:
+            skipped.append(f"{station}: {e}")
+            import traceback; traceback.print_exc()
+
+    if src.lower().endswith(".zip"):
+        if cb: cb("解析ZIP中...", src)
+        with zipfile.ZipFile(src, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir(): continue
+                fn = info.filename
+                if not fn.lower().endswith((".xls", ".txt")): continue
+                st = _detect_station_from_path(fn)
+                with zf.open(info) as f:
+                    _add_file(st, f.read())
+    elif os.path.isdir(src):
+        if cb: cb("扫描文件夹...", src)
+        for root, _, files in os.walk(src):
+            for fn in files:
+                if not fn.lower().endswith((".xls", ".txt")): continue
+                fp = os.path.join(root, fn)
+                st = _detect_station_from_path(fp)
+                try:
+                    with open(fp, "rb") as f: raw = f.read()
+                    _add_file(st, raw)
+                except Exception as e:
+                    skipped.append(f"{fn}: {e}")
+    else:
+        # 单文件
+        fp = src
+        st = _detect_station_from_path(fp)
+        try:
+            with open(fp, "rb") as f: raw = f.read()
+            _add_file(st, raw)
         except Exception as e:
             skipped.append(f"{os.path.basename(fp)}: {e}")
-    if src.endswith(".zip"):
-        if cb: cb("解压中...", src)
-        with TemporaryDirectory() as td:
-            with zipfile.ZipFile(src,"r") as zf: zf.extractall(td)
-            for root,_,files in os.walk(td):
-                for fn in files:
-                    if fn.lower().endswith((".xls",".txt")):
-                        _process(os.path.join(root, fn))
-    elif os.path.isdir(src):
-        if cb: cb("扫描中...", src)
-        for root,_,files in os.walk(src):
-            for fn in files:
-                if fn.lower().endswith((".xls",".txt")):
-                    _process(os.path.join(root, fn))
-    else:
-        _process(src)
+
     return all_recs, skipped, dict(station_files)
 
 # ═══════════════════════════════════════════════
