@@ -488,7 +488,7 @@ def _run_gui():
                 self.cards[k]["v"].pack(); self.cards[k]["l"].pack()
 
             # Tables
-            n=tk.Notebook(right); n.pack(fill="both",expand=True)
+            n=ttk.Notebook(right); n.pack(fill="both",expand=True)
             # Tab1: test items
             t1=tk.Frame(n,bg=STYLE["card_bg"]); n.add(t1,text="📊 测试项(周期)")
             self.test_tree=ttk.Treeview(t1,columns=("test","cycles","fail","rate"),show="headings",height=14)
