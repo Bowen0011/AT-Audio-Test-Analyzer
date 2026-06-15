@@ -264,30 +264,50 @@ def chart_failure_reasons(a, out):
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 def chart_sn_fail_detail(a, out):
-    """每台失败SN的问题点一览（横向柱状图）"""
+    """每台失败SN的Top3问题点（分组柱状图）"""
     _get_font()
     fl = a["fail_list"]
     if not fl: return
-    # 按失败项数排序，截取前30台
     sns = fl[:30]
     n = len(sns)
-    labels = [f"{s['sn'][-8:]} [{s['station']}]" for s in sns]
-    fail_counts = [len(s["failed"]) for s in sns]
 
-    fig, ax = plt.subplots(figsize=(12, max(6, n*0.35)))
-    colors = [C["fail"] if c>=3 else C["warn"] for c in fail_counts]
-    bars = ax.barh(range(n), fail_counts, color=colors, height=0.6)
-    ax.set_yticks(range(n))
-    ax.set_yticklabels(labels, fontsize=8, fontfamily="monospace")
-    ax.set_xlabel("失败项数", fontsize=12)
-    ax.set_title("每台不良设备失败项数", fontsize=14, fontweight="bold")
-    ax.invert_yaxis()
-    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    # 标注前3个失败项
-    for i, s in enumerate(sns):
-        items = ", ".join(s["failed"][:3])
-        if items:
-            ax.text(len(s["failed"])+0.1, i, items[:60], va="center", fontsize=7, color="#555")
+    # 准备数据: 每台设备取前3个失败项
+    sn_labels = [f"{s['sn'][-8:]}\n[{s['station']}]" for s in sns]
+    cats = ["Top1", "Top2", "Top3"]
+    colors = [C["fail"], C["warn"], C["accent"]]
+    
+    fig, ax = plt.subplots(figsize=(max(14, n*0.5), 7))
+    x = range(n)
+    bar_w = 0.25
+    
+    for j, (cat, color) in enumerate(zip(cats, colors)):
+        values = []
+        labels_list = []
+        for s in sns:
+            failed = s["failed"]
+            if j < len(failed):
+                values.append(1)  # 每项记1次
+                labels_list.append(failed[j][:18])
+            else:
+                values.append(0)
+                labels_list.append("")
+        
+        bars = ax.bar([i + j*bar_w for i in x], values, bar_w, label=cat, color=color)
+        # 标注失败项名称
+        for i, (bar, lbl) in enumerate(zip(bars, labels_list)):
+            if lbl:
+                ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.02, lbl,
+                        ha="center", va="bottom", fontsize=7, rotation=90, color="#333")
+
+    ax.set_xticks([i + bar_w for i in x])
+    ax.set_xticklabels(sn_labels, fontsize=7, fontfamily="monospace")
+    ax.set_ylabel("", fontsize=1)
+    ax.set_title("每台不良设备 Top3 失败项", fontsize=14, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.set_ylim(0, 1.6)
+    ax.yaxis.set_visible(False)
+    for spine in ["top","right","left"]:
+        ax.spines[spine].set_visible(False)
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 # ═══════════════════════════════════════════════
