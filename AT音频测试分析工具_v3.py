@@ -263,22 +263,31 @@ def chart_failure_reasons(a, out):
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
-def chart_channel_failure(a, out):
+def chart_sn_fail_detail(a, out):
+    """每台失败SN的问题点一览（横向柱状图）"""
     _get_font()
-    cf = a["channel_failure"]
-    if not cf: return
-    items = sorted(cf.items(), key=lambda x: -x[1])[:10]
-    labels = [k[:20] for k,_ in items]
-    counts = [v for _,v in items]
-    fig, ax = plt.subplots(figsize=(8,5))
-    ax.bar(range(len(items)), counts, color=C["fail"])
-    ax.set_xticks(range(len(items)))
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel("失败次数", fontsize=12)
-    ax.set_title("失败通道分布", fontsize=14, fontweight="bold")
-    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    for i, c in enumerate(counts):
-        ax.text(i, c+0.2, str(c), ha="center", fontsize=9, fontweight="bold")
+    fl = a["fail_list"]
+    if not fl: return
+    # 按失败项数排序，截取前30台
+    sns = fl[:30]
+    n = len(sns)
+    labels = [f"{s['sn'][-8:]} [{s['station']}]" for s in sns]
+    fail_counts = [len(s["failed"]) for s in sns]
+
+    fig, ax = plt.subplots(figsize=(12, max(6, n*0.35)))
+    colors = [C["fail"] if c>=3 else C["warn"] for c in fail_counts]
+    bars = ax.barh(range(n), fail_counts, color=colors, height=0.6)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(labels, fontsize=8, fontfamily="monospace")
+    ax.set_xlabel("失败项数", fontsize=12)
+    ax.set_title("每台不良设备失败项数", fontsize=14, fontweight="bold")
+    ax.invert_yaxis()
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    # 标注前3个失败项
+    for i, s in enumerate(sns):
+        items = ", ".join(s["failed"][:3])
+        if items:
+            ax.text(len(s["failed"])+0.1, i, items[:60], va="center", fontsize=7, color="#555")
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 # ═══════════════════════════════════════════════
@@ -317,7 +326,7 @@ td{{padding:7px 8px;border-bottom:1px solid #eceff1}}tr:hover td{{background:#f5
 <div class="sec"><h2>📋 各站别统计</h2><table>
 <tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th></tr>{station_table}</table></div>
 <div class="sec"><h2>📊 失败原因</h2><img src="chart_failure_reasons.png"></div>
-<div class="sec"><h2>📊 失败通道</h2><img src="chart_channel_failure.png"></div>
+<div class="sec"><h2>📊 每台不良设备详情</h2><img src="chart_sn_fail_detail.png"></div>
 <div class="sec"><h2>🔴 失败SN明细</h2><table>
 <tr><th>SN</th><th>站别</th><th>失败项数</th><th>失败测试项</th></tr>{sn_table}</table></div>
 </div></body></html>"""
@@ -557,7 +566,7 @@ def _run_gui():
                     _get_font()
                     chart_station_yield(a, os.path.join(od, "chart_station_yield.png"))
                     chart_failure_reasons(a, os.path.join(od, "chart_failure_reasons.png"))
-                    chart_channel_failure(a, os.path.join(od, "chart_channel_failure.png"))
+                    chart_sn_fail_detail(a, os.path.join(od, "chart_sn_fail_detail.png"))
                 if self.opt_csv.get():
                     self.root.after(0, lambda: self.prog.set(85))
                     self._write_csv(os.path.join(od, "detail.csv"))
