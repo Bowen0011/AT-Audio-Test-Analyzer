@@ -52,13 +52,19 @@ def _detect_enc(fp):
 # ═══════════════════════════════════════════════
 # 解析器
 # ═══════════════════════════════════════════════
+def _detect_station(filepath):
+    """从文件路径中提取站别名(ATxx)，向上逐级查找"""
+    p = Path(filepath)
+    for parent in [p] + list(p.parents):
+        name = parent.name
+        if name.startswith("AT") and len(name) <= 6 and name[2:].isdigit():
+            return name
+    return os.path.basename(os.path.dirname(filepath))  # fallback
+
 # 列映射: Time[0] SN[1] TestChNum[2] TestName[3] Unit[4] Result[5] Channel[6] Value[7]...
 def parse_file(filepath):
     enc = _detect_enc(filepath)
-    p = Path(filepath)
-    station = p.parent.parent.parent.parent.name
-    if not station.startswith("AT"):
-        station = p.parent.parent.parent.name
+    station = _detect_station(filepath)
 
     with open(filepath,"rb") as f: raw = f.read()
     text = raw.decode(enc, errors="replace")
@@ -92,7 +98,14 @@ def parse_file(filepath):
     return records
 
 def parse_source(src, cb=None):
-    all_recs = []; skipped = []
+    all_recs = []; skipped = []; station_files = defaultdict(int)
+    def _process(fp):
+        try:
+            st = _detect_station(fp)
+            station_files[st] += 1
+            all_recs.extend(parse_file(fp))
+        except Exception as e:
+            skipped.append(f"{os.path.basename(fp)}: {e}")
     if src.endswith(".zip"):
         if cb: cb("解压中...", src)
         with TemporaryDirectory() as td:
@@ -100,20 +113,16 @@ def parse_source(src, cb=None):
             for root,_,files in os.walk(td):
                 for fn in files:
                     if fn.lower().endswith((".xls",".txt")):
-                        fp = os.path.join(root, fn)
-                        try: all_recs.extend(parse_file(fp))
-                        except Exception as e: skipped.append(f"{fn}: {e}")
+                        _process(os.path.join(root, fn))
     elif os.path.isdir(src):
         if cb: cb("扫描中...", src)
         for root,_,files in os.walk(src):
             for fn in files:
                 if fn.lower().endswith((".xls",".txt")):
-                    fp = os.path.join(root, fn)
-                    try: all_recs.extend(parse_file(fp))
-                    except Exception as e: skipped.append(f"{fn}: {e}")
+                    _process(os.path.join(root, fn))
     else:
-        all_recs = parse_file(src)
-    return all_recs, skipped
+        _process(src)
+    return all_recs, skipped, dict(station_files)
 
 # ═══════════════════════════════════════════════
 # 分析器 — 按SN去重，取最终结果
@@ -177,6 +186,13 @@ def analyze(records):
          for sn, v in sn_results.items() if not v["passed"]],
         key=lambda x: -len(x["failed"])
     )
+    # 全部SN列表(按站别分组)
+    all_sn_by_station = defaultdict(list)
+    for sn, v in sn_results.items():
+        all_sn_by_station[v["station"]].append({
+            "sn": sn, "passed": v["passed"],
+            "failed": v["failed_items"], "total": v["total_items"],
+        })
 
     return {
         "total_sn": total_sn,
@@ -187,6 +203,7 @@ def analyze(records):
         "failure_counter": dict(failure_counter),
         "channel_failure": dict(channel_failure),
         "fail_list": fail_list,
+        "all_sn_by_station": dict(all_sn_by_station),
         "total_raw_rows": len(records),
     }
 
@@ -448,6 +465,13 @@ def _run_gui():
             self.sn_tree.pack(fill="both", expand=True)
             self.sn_tree.tag_configure("critical", foreground="#F44336")
 
+            # Tab4: All SNs by station
+            t4 = tk.Frame(nb, bg=STYLE["card_bg"]); nb.add(t4, text="📋 全部SN")
+            # Use a sub-notebook for per-station tabs
+            self.all_nb = ttk.Notebook(t4)
+            self.all_nb.pack(fill="both", expand=True)
+            self.all_trees = {}  # station -> treeview
+
             # Bottom
             btns = tk.Frame(right, bg=STYLE["bg"]); btns.pack(fill="x", pady=(6,0))
             self.br = tk.Button(btns, text="📄 打开报告", command=self._open_r, bg=STYLE["success"], fg="white",
@@ -489,11 +513,12 @@ def _run_gui():
         def _run(self, s):
             try:
                 self.root.after(0, lambda: self.prog.set(10))
-                recs, skipped = parse_source(s, cb=lambda ph,dt: self.root.after(0, lambda: self.status.set(ph)))
+                recs, skipped, st_files = parse_source(s, cb=lambda ph,dt: self.root.after(0, lambda: self.status.set(ph)))
                 if not recs: raise ValueError("无有效记录")
                 self.records = recs
                 self.root.after(0, lambda: self.prog.set(40))
-                self.root.after(0, lambda: self.status.set(f"解析 {len(recs)}行 → 按SN去重分析..."))
+                sinfo = " ".join(f"{st}({cnt})" for st,cnt in sorted(st_files.items()))
+                self.root.after(0, lambda: self.status.set(f"解析 {len(recs)}行 | 站别文件: {sinfo} | 按SN去重..."))
                 a = analyze(recs); self.analysis = a
                 self.root.after(0, lambda: self.prog.set(60))
                 self.root.after(0, lambda: self._show(a))
@@ -538,6 +563,10 @@ def _run_gui():
             self.cards["yield"]["v"].configure(text=f"{a['yield_rate']:.1f}%")
             for t in [self.st_tree, self.fr_tree, self.sn_tree]:
                 for i in t.get_children(): t.delete(i)
+            # Clear all_sn sub-tabs
+            for st, (frame, tree) in list(self.all_trees.items()):
+                self.all_nb.forget(frame)
+            self.all_trees.clear()
 
             # Station
             for s in sorted(a["station_stats"].keys()):
@@ -557,10 +586,32 @@ def _run_gui():
                 items = ", ".join(s["failed"][:5])
                 self.sn_tree.insert("", "end", values=(s["sn"], s["station"], f"{len(s['failed'])}/{s['total']}", items))
 
+            # All SNs by station
+            for st in sorted(a["all_sn_by_station"].keys()):
+                sns = sorted(a["all_sn_by_station"][st], key=lambda x: x["sn"])
+                frame = tk.Frame(self.all_nb, bg=STYLE["card_bg"])
+                tree = ttk.Treeview(frame, columns=("sn","result","fail_items"), show="headings", height=12)
+                tree.heading("sn", text="SN"); tree.column("sn", width=170)
+                tree.heading("result", text="结果"); tree.column("result", width=60, anchor="center")
+                tree.heading("fail_items", text="失败项"); tree.column("fail_items", width=400)
+                tree.pack(fill="both", expand=True)
+                tree.tag_configure("pass", foreground="#4CAF50")
+                tree.tag_configure("fail", foreground="#F44336")
+                for sn in sns:
+                    tag = "pass" if sn["passed"] else "fail"
+                    result = "✅ PASS" if sn["passed"] else "❌ FAIL"
+                    fails = ", ".join(sn["failed"][:5]) if sn["failed"] else ""
+                    tree.insert("", "end", values=(sn["sn"], result, fails), tags=(tag,))
+                self.all_nb.add(frame, text=f"{st}({len(sns)})")
+                self.all_trees[st] = (frame, tree)
+
         def _clear(self):
             for k in self.cards: self.cards[k]["v"].configure(text="—")
             for t in [self.st_tree, self.fr_tree, self.sn_tree]:
                 for i in t.get_children(): t.delete(i)
+            for st, (frame, tree) in list(self.all_trees.items()):
+                self.all_nb.forget(frame)
+            self.all_trees.clear()
             self.html_path = None
             self.br.configure(state="disabled"); self.bf.configure(state="disabled")
 
