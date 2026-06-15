@@ -264,54 +264,69 @@ def chart_failure_reasons(a, out):
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 def chart_sn_fail_detail(a, out):
-    """每台失败SN的Top3问题点（水平分组条形图，标签写在柱内）"""
+    """按通道汇总失败项（分组柱状图，分通道分测试项）"""
     _get_font()
-    fl = a["fail_list"]
-    if not fl: return
-    sns = fl[:30]
-    cols = ["#E53935", "#FB8C00", "#1E88E5"]  # Top1红 Top2橙 Top3蓝
+    fc = a["failure_counter"]
+    if not fc: return
 
-    # 每台设备产生最多3个水平条，紧凑排列
-    rows = []
-    for s in sns:
-        for j, item in enumerate(s["failed"][:3]):
-            rows.append((f"{s['sn'][-8:]}", s["station"], j+1, item))
-    n = len(rows)
-    if n == 0: return
+    # 按 test_ch(通道) 分组，每个通道下按 count 排序的测试项
+    # display格式: "右主2气密性 FR" → test_ch="右主2气密性", test_name="FR"
+    by_channel = defaultdict(list)
+    for display, cnt in fc.items():
+        parts = display.rsplit(" ", 1)
+        ch = parts[0] if len(parts) > 1 else display
+        tn = parts[1] if len(parts) > 1 else ""
+        by_channel[ch].append((tn, cnt))
 
-    fig, ax = plt.subplots(figsize=(12, max(5, n*0.3)))
-    y = 0
-    y_ticks = []; y_labels = []
-    prev_sn = None
-    
-    for i, (sn_short, station, rank, item) in enumerate(rows):
-        color = cols[rank-1]
-        ax.barh(n-1-i, 1, height=0.75, color=color, edgecolor="white", linewidth=0.5)
-        # 标签写在柱内
-        label = f"#{rank} {item[:22]}"
-        ax.text(0.05, n-1-i, label, va="center", fontsize=8, color="white", fontweight="bold")
-        # SN标签只在每组第一条显示
-        if sn_short != prev_sn:
-            y_ticks.append(n-1-i)
-            y_labels.append(f"{sn_short} [{station}]")
-            prev_sn = sn_short
+    # 按通道总失败数排序，取top10通道
+    ch_total = [(ch, sum(c for _,c in items)) for ch, items in by_channel.items()]
+    ch_total.sort(key=lambda x: -x[1])
+    top_ch = [ch for ch, _ in ch_total[:10]]
 
-    ax.set_yticks(y_ticks)
-    ax.set_yticklabels(y_labels, fontsize=8, fontfamily="monospace")
-    ax.set_xlim(0, 1.5)
-    ax.set_xticks([])
-    ax.set_title("每台不良设备 Top3 失败项", fontsize=14, fontweight="bold")
-    for spine in ["top","right","bottom"]:
-        ax.spines[spine].set_visible(False)
+    # 为每个通道准备分组柱状图
+    ch_labels = []
+    all_bars = []  # [(label, count, color_idx)]
+    colors = ["#E53935", "#FB8C00", "#1E88E5", "#43A047", "#8E24AA"]
     
-    # 图例
-    from matplotlib.patches import Patch
-    ax.legend(handles=[
-        Patch(facecolor=cols[0], label="Top1 主要问题"),
-        Patch(facecolor=cols[1], label="Top2"),
-        Patch(facecolor=cols[2], label="Top3"),
-    ], loc="lower right", fontsize=8, ncol=3)
-    
+    for ch in top_ch:
+        items = sorted(by_channel[ch], key=lambda x: -x[1])
+        ch_labels.append(ch[:14])
+        for i, (tn, cnt) in enumerate(items[:3]):  # 每通道最多3项
+            all_bars.append((f"{tn}", cnt, i))
+
+    fig, ax = plt.subplots(figsize=(max(10, len(top_ch)*0.9), 6))
+    x = range(len(top_ch))
+    bar_w = 0.22
+    max_cnt = max(c for _,c,_ in all_bars) if all_bars else 1
+
+    # 按位置分层绘制
+    for pos in range(3):
+        vals = []
+        labels_for_pos = []
+        for ch_idx, ch in enumerate(top_ch):
+            items = sorted(by_channel[ch], key=lambda x: -x[1])
+            if pos < len(items):
+                vals.append(items[pos][1])
+                labels_for_pos.append(items[pos][0][:10])
+            else:
+                vals.append(0)
+                labels_for_pos.append("")
+        
+        bars = ax.bar([i + pos*bar_w for i in x], vals, bar_w,
+                       color=colors[pos], edgecolor="white", linewidth=0.3,
+                       label=["#1最大项","#2","#3"][pos])
+        for i, (bar, lbl, v) in enumerate(zip(bars, labels_for_pos, vals)):
+            if v > 0 and lbl:
+                ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3,
+                        lbl, ha="center", va="bottom", fontsize=7, rotation=45, color="#333")
+
+    ax.set_xticks([i + bar_w for i in x])
+    ax.set_xticklabels(ch_labels, fontsize=8, rotation=20, ha="right")
+    ax.set_ylabel("失败SN数", fontsize=12)
+    ax.set_title("各通道失败项分布（按SN去重）", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=8, ncol=3, loc="upper right")
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    ax.set_ylim(0, max_cnt*1.4)
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 # ═══════════════════════════════════════════════
@@ -350,7 +365,7 @@ td{{padding:7px 8px;border-bottom:1px solid #eceff1}}tr:hover td{{background:#f5
 <div class="sec"><h2>📋 各站别统计</h2><table>
 <tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th></tr>{station_table}</table></div>
 <div class="sec"><h2>📊 失败原因</h2><img src="chart_failure_reasons.png"></div>
-<div class="sec"><h2>📊 每台不良设备详情</h2><img src="chart_sn_fail_detail.png"></div>
+<div class="sec"><h2>📊 各通道失败项分布</h2><img src="chart_sn_fail_detail.png"></div>
 <div class="sec"><h2>🔴 失败SN明细</h2><table>
 <tr><th>SN</th><th>站别</th><th>失败项数</th><th>失败测试项</th></tr>{sn_table}</table></div>
 </div></body></html>"""
