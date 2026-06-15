@@ -430,7 +430,6 @@ def _run_gui():
             root.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
 
         def _build(self):
-            tk=self.__class__.__dict__; ttk=ttk
             hdr=tk.Frame(self.root,bg=STYLE["accent"],height=52)
             hdr.pack(fill="x"); hdr.pack_propagate(False)
             tk.Label(hdr,text="🔊 AT Audio Test 数据分析工具 v3.1",bg=STYLE["accent"],fg="white",
