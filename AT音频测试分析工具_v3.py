@@ -234,7 +234,7 @@ def chart_station_yield(a, out):
     yields = [a["station_stats"][s]["pass"]/a["station_stats"][s]["total"]*100 for s in sts]
     totals = [a["station_stats"][s]["total"] for s in sts]
     fig, ax = plt.subplots(figsize=(max(8,len(sts)*1.5), 5))
-    bars = ax.bar(sts, yields, color=[C["pass"] if y>=95 else C["warn"] if y>=90 else C["fail"] for y in yields])
+    bars = ax.bar(sts, yields, color=[C["pass"] if y>=97 else C["warn"] if y>=95 else C["fail"] for y in yields])
     ax.set_ylabel("良率 (%)", fontsize=12)
     ax.set_title("各站别良率", fontsize=14, fontweight="bold")
     for bar, y, t in zip(bars, yields, totals):
@@ -328,7 +328,7 @@ def make_html(a, out_dir, out_path, source_info=""):
     for s in sorted(a["station_stats"].keys()):
         d = a["station_stats"][s]
         r = d["pass"]/d["total"]*100 if d["total"] else 0
-        cls = "bg" if r>=95 else "bo" if r>=90 else "br"
+        cls = "bg" if r>=97 else "bo" if r>=95 else "br"
         st_rows.append(f"<tr><td><strong>{s}</strong></td><td>{d['total']}</td>"
                        f"<td>{d['pass']}</td><td>{d['fail']}</td><td><span class='badge {cls}'>{r:.1f}%</span></td></tr>")
     # SN table
@@ -338,7 +338,7 @@ def make_html(a, out_dir, out_path, source_info=""):
         sn_rows.append(f"<tr><td><code>{s['sn']}</code></td><td>{s['station']}</td>"
                        f"<td>{len(s['failed'])}/{s['total']}</td><td style='font-size:11px'>{items}</td></tr>")
 
-    yc = "g" if a["yield_rate"]>=95 else "o" if a["yield_rate"]>=90 else "r"
+    yc = "g" if a["yield_rate"]>=97 else "o" if a["yield_rate"]>=95 else "r"
     html = _HTML.format(
         report_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         source_info=source_info,
@@ -600,7 +600,7 @@ def _run_gui():
             for s in sorted(a["station_stats"].keys()):
                 d = a["station_stats"][s]
                 r = d["pass"]/d["total"]*100 if d["total"] else 0
-                tag = "good" if r>=95 else "warn" if r>=90 else "bad"
+                tag = "good" if r>=97 else "warn" if r>=95 else "bad"
                 self.st_tree.insert("", "end", values=(s, d["total"], d["pass"], d["fail"], f"{r:.1f}%"), tags=(tag,))
 
             # Failure reasons
