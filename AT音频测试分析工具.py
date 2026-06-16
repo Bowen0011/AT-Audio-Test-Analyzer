@@ -1,1192 +1,709 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AT Audio Test 数据分析工具
-===========================
-独立单文件 GUI 工具。双击运行即可。
-- 选择 .zip / 文件夹 / 单个 .xls .txt 数据源
-- UI 内实时预览 Summary + 站别统计 + 失败SN
-- 一键生成 HTML 报告 + PNG 图表 + CSV 明细
-- 后台线程解析，界面不冻结
+AT Audio Test 数据分析工具 v4.0
+===============================
+支持 Format A (9行块) 和 Format B (行级40项) 两种日志格式。
+取每项最终结果判定SN良率。
 
-依赖: Python 3.8+, matplotlib
-工作电脑安装: pip install matplotlib
+输出: 直观汇总 + 分站别统计 + 失败原因 + HTML报告 + 图表
+- 自动识别编码（GBK/UTF-8等），不依赖SN前缀
+- 按SN去重取各项最终结果，精准判定良率
+- 颜色阈值: ≥97%绿 / 95-97%黄 / <95%红
 """
 
-import os, sys, re, csv, json, zipfile, threading, datetime, warnings, webbrowser, subprocess
+import os, sys, csv, zipfile, threading, datetime, warnings, webbrowser, subprocess
 from pathlib import Path
 from collections import defaultdict, Counter
 from tempfile import TemporaryDirectory
 
-# ── matplotlib ──
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.font_manager import FontProperties
 
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore")
 
-# ═══════════════════════════════════════════════════════════════════
-# 常量
-# ═══════════════════════════════════════════════════════════════════
+_CJK = ["SimHei","Microsoft YaHei","PingFang SC","Noto Sans CJK SC","WenQuanYi Micro Hei","STHeiti","SimSun"]
+_ENCS = ["gbk","gb2312","gb18030","utf-8","utf-16","latin-1"]
+C = {"pass":"#4CAF50","fail":"#F44336","warn":"#FF9800","accent":"#2196F3","bar_pass":"#81C784","bar_fail":"#E57373"}
+STYLE = {"bg":"#f0f2f5","fg":"#1a1a2e","card_bg":"#ffffff","accent":"#2196F3","accent_hover":"#1976D2",
+         "success":"#4CAF50","danger":"#F44336","warning":"#FF9800","text_secondary":"#78909c",
+         "input_bg":"#ffffff","tree_bg":"#ffffff","tree_sel":"#E3F2FD","progress_bg":"#e0e0e0"}
 
-_CJK_FONTS = [
-    "SimHei", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
-    "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Source Han Sans SC",
-    "STHeiti", "Heiti SC", "SimSun", "FangSong", "KaiTi",
-]
-_ENCODINGS = ["gbk", "gb2312", "gb18030", "utf-8", "utf-16", "latin-1"]
-COLORS = {"pass": "#4CAF50", "fail": "#F44336", "unknown": "#9E9E9E",
-          "bar_pass": "#81C784", "bar_fail": "#E57373", "highlight": "#FF9800"}
-
-_chinese_font = None
-
+_font = None
 def _get_font():
-    global _chinese_font
-    if _chinese_font is not None:
-        return _chinese_font
-    available = set(f.name for f in matplotlib.font_manager.fontManager.ttflist)
-    for name in _CJK_FONTS:
-        if name in available:
-            _chinese_font = FontProperties(family=name)
-            break
-    if _chinese_font is None:
-        _chinese_font = FontProperties()
-    plt.rcParams["font.family"] = _chinese_font.get_name()
+    global _font
+    if _font: return _font
+    av = set(f.name for f in matplotlib.font_manager.fontManager.ttflist)
+    for n in _CJK:
+        if n in av: _font = FontProperties(family=n); break
+    if not _font: _font = FontProperties()
+    plt.rcParams["font.family"] = _font.get_name()
     plt.rcParams["axes.unicode_minus"] = False
-    return _chinese_font
+    return _font
 
+# ═══════════════════════════════════════════════
+# 解析器
+# ═══════════════════════════════════════════════
+def _detect_station_from_path(filepath):
+    """从文件路径中提取站别名(ATxx)，向上逐级查找"""
+    p = Path(filepath)
+    for parent in [p] + list(p.parents):
+        name = parent.name
+        if name.startswith("AT") and len(name) <= 6 and name[2:].isdigit():
+            return name
+    return os.path.basename(os.path.dirname(filepath))  # fallback
 
-# ═══════════════════════════════════════════════════════════════════
-# 核心解析器
-# ═══════════════════════════════════════════════════════════════════
-
-def _detect_encoding(filepath):
-    for enc in _ENCODINGS:
+def _detect_enc_from_bytes(raw):
+    """从原始字节检测编码"""
+    for e in _ENCS:
         try:
-            with open(filepath, "rb") as f:
-                data = f.read(4096)
-            text = data.decode(enc, errors="replace")
-            if "SN" in text or "BLKVUN" in text:
-                return enc
-        except Exception:
-            continue
+            if "SN" in raw[:8192].decode(e, errors="replace"): return e
+        except: continue
     return "gbk"
 
+# 列映射: Time[0] SN[1] TestChNum[2] TestName[3] Unit[4] Result[5] Channel[6] Value[7]...
+def parse_bytes(raw, station):
+    """从原始字节解析记录，需要传入已知的站别名"""
+    enc = _detect_enc_from_bytes(raw)
+    text = raw.decode(enc, errors="replace")
+    records = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("Time"): continue
+        flds = line.split("\t")
+        if len(flds) < 8: continue
+        time_str = flds[0].strip()
+        sn = flds[1].strip().strip("'\"")
+        test_ch = flds[2].strip()
+        test_name = flds[3].strip()
+        result = flds[5].strip()
+        if not result or result not in ("Pass","Fail","pass","fail"): continue
 
-def iter_records(filepath):
-    """逐条产出测试记录 dict"""
-    encoding = _detect_encoding(filepath)
-    station_name = Path(filepath).parent.parent.name
-    # 如果取到的是临时目录名（如 tmpXXXXXX），退一级
-    if station_name.startswith("tmp") or len(station_name) < 2:
-        station_name = Path(filepath).parent.name
+        val_str = flds[7].strip() if len(flds) > 7 else ""
+        value = None
+        if val_str:
+            try: value = float(val_str)
+            except: pass
 
-    with open(filepath, "rb") as f:
-        raw = f.read()
-    text = raw.decode(encoding, errors="replace")
-    lines = text.split("\n")
+        try: t = datetime.datetime.strptime(time_str, "%Y/%m/%d %H:%M:%S")
+        except: t = None
 
-    header_cols = None
-    limits_lo = []  # Row 0: upper spec limits (from col 8)
-    limits_hi = []  # Row 1: lower spec limits (from col 8)
-    for i, line in enumerate(lines):
-        if i == 0:
-            limits_lo = line.strip().split("\t")
-        elif i == 1:
-            limits_hi = line.strip().split("\t")
-        if line.startswith("SN\t") or line.startswith("SN\r"):
-            header_cols = line.strip().split("\t")
-    if header_cols is None:
-        raise ValueError(f"未找到表头: {filepath}")
+        records.append({
+            "sn": sn, "test_ch": test_ch, "test_name": test_name,
+            "display": f"{test_ch} {test_name}".strip(),
+            "result": result, "value": value, "station": station, "time": t,
+        })
+    return records
 
-    sn_indices = [i for i, line in enumerate(lines)
-                  if re.match(r"^[A-Z0-9]{10,30}$", line.split("\t")[0].strip())
-                  and not line.startswith("^")]
+def parse_source(src, cb=None):
+    all_recs = []; skipped = []; station_files = defaultdict(int)
 
-    if not sn_indices:
-        raise ValueError(f"未找到测试记录: {filepath}")
-
-    record_span = sn_indices[1] - sn_indices[0] if len(sn_indices) >= 2 and 5 <= sn_indices[1] - sn_indices[0] <= 15 else 9
-
-    for sn_line_num in sn_indices:
+    def _add_file(station, raw):
+        """处理单个文件的内存数据"""
+        station_files[station] += 1
         try:
-            fields = lines[sn_line_num].strip().split("\t")
-            if len(fields) < 8:
-                continue
-            record = {
-                "sn": fields[0].strip(), "date": fields[1].strip() if len(fields) > 1 else "",
-                "fixture_id": fields[2].strip() if len(fields) > 2 else "",
-                "station": fields[3].strip() if len(fields) > 3 else "",
-                "project": fields[4].strip() if len(fields) > 4 else "",
-                "result": fields[5].strip() if len(fields) > 5 else "",
-                "error_code": fields[6].strip() if len(fields) > 6 else "",
-                "cycle_time": fields[7].strip() if len(fields) > 7 else "",
-                "file_source": station_name,
-                "file_path": filepath,
-                "header_cols": header_cols,
-                "_limits_lo": limits_lo,
-                "_limits_hi": limits_hi,
-                "_fields_raw": fields,
-            }
-            # SPA values (line +5)
-            spa_line = sn_line_num + 5
-            if spa_line < len(lines):
-                sf = lines[spa_line].strip().split("\t")
-                record["spa_values"] = [sf[i].strip() if i < len(sf) else "" for i in range(5)]
-            else:
-                record["spa_values"] = []
-            # freq sweep (line +8)
-            sweep_line = sn_line_num + 8
-            if sweep_line < len(lines):
-                record["freq_sweep"] = [s.strip() for s in lines[sweep_line].strip().split("\t")[1:] if s.strip()]
-            else:
-                record["freq_sweep"] = []
-            # product info (line +2)
-            pi_line = sn_line_num + 2
-            if pi_line < len(lines) and "GETPRODUCTINFO:" in lines[pi_line]:
-                record["product_info"] = lines[pi_line].split("GETPRODUCTINFO:")[-1].strip()
-            else:
-                record["product_info"] = ""
-            yield record
-        except Exception:
-            continue
+            recs = parse_bytes(raw, station)
+            all_recs.extend(recs)
+        except Exception as e:
+            skipped.append(f"{station}: {e}")
+            import traceback; traceback.print_exc()
 
-def parse_source(source_path, progress_callback=None):
-    """统一入口：支持 zip / 文件夹 / 单文件
-    progress_callback(phase, detail) 用于 GUI 进度反馈
-    返回 (records, skipped_files)
-    """
-    all_records = []
-    skipped = []
-
-    if source_path.endswith(".zip"):
-        if progress_callback: progress_callback("解压中...", source_path)
-        with TemporaryDirectory() as tmpdir:
-            with zipfile.ZipFile(source_path, "r") as zf:
-                zf.extractall(tmpdir)
-            for root, dirs, files in os.walk(tmpdir):
-                for fname in files:
-                    if fname.lower().endswith((".xls", ".txt")):
-                        fpath = os.path.join(root, fname)
-                        try:
-                            all_records.extend(iter_records(fpath))
-                        except Exception as e:
-                            skipped.append(f"{fname}: {e}")
-    elif os.path.isdir(source_path):
-        if progress_callback: progress_callback("扫描文件夹...", source_path)
-        for root, dirs, files in os.walk(source_path):
-            for fname in files:
-                if fname.lower().endswith((".xls", ".txt")):
-                    fpath = os.path.join(root, fname)
-                    try:
-                        all_records.extend(iter_records(fpath))
-                    except Exception as e:
-                        skipped.append(f"{fname}: {e}")
+    if src.lower().endswith(".zip"):
+        if cb: cb("解析ZIP中...", src)
+        with zipfile.ZipFile(src, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir(): continue
+                fn = info.filename
+                if not fn.lower().endswith((".xls", ".txt")): continue
+                st = _detect_station_from_path(fn)
+                with zf.open(info) as f:
+                    _add_file(st, f.read())
+    elif os.path.isdir(src):
+        if cb: cb("扫描文件夹...", src)
+        for root, _, files in os.walk(src):
+            for fn in files:
+                if not fn.lower().endswith((".xls", ".txt")): continue
+                fp = os.path.join(root, fn)
+                st = _detect_station_from_path(fp)
+                try:
+                    with open(fp, "rb") as f: raw = f.read()
+                    _add_file(st, raw)
+                except Exception as e:
+                    skipped.append(f"{fn}: {e}")
     else:
-        if progress_callback: progress_callback("读取文件...", source_path)
-        for rec in iter_records(source_path):
-            all_records.append(rec)
-        parent = Path(source_path).parent.parent.name
-        if parent.startswith("tmp") or len(parent) < 2:
-            parent = Path(source_path).parent.name
-        for r in all_records:
-            r["file_source"] = parent
+        # 单文件
+        fp = src
+        st = _detect_station_from_path(fp)
+        try:
+            with open(fp, "rb") as f: raw = f.read()
+            _add_file(st, raw)
+        except Exception as e:
+            skipped.append(f"{os.path.basename(fp)}: {e}")
 
-    return all_records, skipped
+    return all_recs, skipped, dict(station_files)
 
-# ═══════════════════════════════════════════════════════════════════
-# 分析引擎
-# ═══════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════
+# 分析器 — 按SN去重，取最终结果
+# ═══════════════════════════════════════════════
 def analyze(records):
-    if not records:
-        return {"error": "无有效记录"}
+    if not records: return {"error": "无记录"}
 
-    total = len(records)
-    pass_recs = [r for r in records if r["result"] == "PASS"]
-    fail_recs = [r for r in records if r["result"] != "PASS" and r["result"]]
-    pass_count, fail_count = len(pass_recs), len(fail_recs)
-
-    by_station = defaultdict(lambda: {"total": 0, "pass": 0, "fail": 0, "fail_sns": [], "cycle_times": []})
+    # 按SN分组
+    sn_data = defaultdict(list)
     for r in records:
-        st = r["file_source"]
-        by_station[st]["total"] += 1
-        if r["result"] == "PASS":
-            by_station[st]["pass"] += 1
-        elif r["result"]:
-            by_station[st]["fail"] += 1
-            by_station[st]["fail_sns"].append(r["sn"])
-        try:
-            by_station[st]["cycle_times"].append(float(r["cycle_time"]))
-        except Exception:
-            pass
+        sn_data[r["sn"]].append(r)
 
-    by_sn = defaultdict(lambda: {"stations_failed": [], "fail_count": 0, "results": []})
-    for r in records:
-        sn = r["sn"]
-        info = by_sn[sn]
-        info["results"].append({"station": r["file_source"], "result": r["result"],
-                                "error_code": r["error_code"], "cycle_time": r["cycle_time"],
-                                "date": r["date"]})
-        if r["result"] == "PASS":
-            pass
-        elif r["result"]:
-            info["stations_failed"].append(r["file_source"])
-            info["fail_count"] += 1
+    # 每个SN: 按 (test_ch, test_name) 分组，取最终结果
+    sn_results = {}   # sn -> {station, passed: bool, failed_items: [display], total_items: int}
+    station_stats = defaultdict(lambda: {"total":0, "pass":0, "fail":0, "failed_sns":[]})
+    failure_counter = Counter()  # 失败原因计数（display名）
+    channel_failure = Counter()  # 按通道
 
-    failed_sns = sorted(
-        [{"sn": sn, **{k: v for k, v in info.items()}}
-         for sn, info in by_sn.items() if info["fail_count"] > 0],
-        key=lambda x: x["fail_count"], reverse=True,
+    for sn, items in sn_data.items():
+        items.sort(key=lambda x: x["time"] or datetime.datetime.min)
+        station = items[0]["station"]
+
+        # 按 display 分组，取最后一次结果
+        by_display = defaultdict(list)
+        for item in items:
+            by_display[item["display"]].append(item)
+
+        failed_displays = []
+        for disp, entries in by_display.items():
+            last = entries[-1]
+            if last["result"] in ("Fail", "fail"):
+                failed_displays.append(disp)
+                failure_counter[disp] += 1
+                channel_failure[last["test_ch"]] += 1
+
+        sn_passed = len(failed_displays) == 0
+        sn_results[sn] = {
+            "station": station,
+            "passed": sn_passed,
+            "failed_items": failed_displays,
+            "total_items": len(by_display),
+        }
+        station_stats[station]["total"] += 1
+        if sn_passed:
+            station_stats[station]["pass"] += 1
+        else:
+            station_stats[station]["fail"] += 1
+            station_stats[station]["failed_sns"].append({
+                "sn": sn,
+                "failed": failed_displays,
+                "total": len(by_display),
+            })
+
+    total_sn = len(sn_results)
+    pass_sn = sum(1 for v in sn_results.values() if v["passed"])
+    fail_sn = total_sn - pass_sn
+
+    # 失败SN列表
+    fail_list = sorted(
+        [{"sn": sn, "station": v["station"], "failed": v["failed_items"], "total": v["total_items"]}
+         for sn, v in sn_results.items() if not v["passed"]],
+        key=lambda x: -len(x["failed"])
     )
-
-    by_hour = defaultdict(lambda: {"total": 0, "pass": 0, "fail": 0})
-    for r in records:
-        try:
-            hour = r["date"][8:10] if len(r["date"]) >= 10 else ""
-            if hour:
-                by_hour[hour]["total"] += 1
-                if r["result"] == "PASS":
-                    by_hour[hour]["pass"] += 1
-                elif r["result"]:
-                    by_hour[hour]["fail"] += 1
-        except Exception:
-            pass
-
-    all_ct = []
-    for r in records:
-        try:
-            all_ct.append(float(r["cycle_time"]))
-        except Exception:
-            pass
-    ct_stats = {}
-    if all_ct:
-        sorted_ct = sorted(all_ct)
-        ct_stats = {"avg": sum(all_ct) / len(all_ct), "min": min(all_ct),
-                    "max": max(all_ct), "median": sorted_ct[len(all_ct) // 2]}
-
-    products = set()
-    for r in records:
-        if r.get("product_info"):
-            products.add(r["product_info"])
-
-    multi_fail = [x for x in failed_sns if x["fail_count"] >= 2]
-
-    return {
-        "total": total, "pass": pass_count, "fail": fail_count,
-        "pass_rate": pass_count / total * 100 if total else 0,
-        "fail_rate": fail_count / total * 100 if total else 0,
-        "by_station": dict(by_station),
-        "failed_sns": failed_sns, "multi_fail_sns": multi_fail,
-        "by_hour": dict(by_hour), "cycle_time_stats": ct_stats,
-        "products": list(products), "total_stations": len(by_station),
-    }
-
-
-def analyze_failure_reasons(records, analysis):
-    """失败原因分析 — 逐项对比测量值与规格限，定位超限测试项
-    返回: {categories: [{name, count, pct, detail}], by_station: ...}
-    """
-    failed = [r for r in records if r["result"] != "PASS" and r["result"]]
-    if not failed:
-        return {"categories": [], "by_station": {}, "total_fail": 0}
-
-    reasons = defaultdict(lambda: {"count": 0, "sns": [], "stations": set()})
-
-    for r in failed:
-        matched = False
-        limits_lo = r.get("_limits_lo", [])
-        limits_hi = r.get("_limits_hi", [])
-        header = r.get("header_cols", [])
-
-        # ── SPA 值超限 (cols 10-13, 格式 "<lower,upper>") ──
-        spas = r.get("spa_values", [])
-        if len(spas) >= 5:
-            for ch in range(1, 5):
-                v_str = spas[ch] if ch < len(spas) else ""
-                if not v_str:
-                    continue
-                try:
-                    v = float(v_str)
-                    col_idx = 9 + ch  # cols 10-13
-                    limit_str = limits_lo[col_idx] if col_idx < len(limits_lo) else ""
-                    if limit_str.startswith("<") and "," in limit_str:
-                        parts = limit_str.strip("<>").split(",")
-                        lo = float(parts[0]) if parts[0] else 0
-                        hi = float(parts[1]) if parts[1] else float("inf")
-                        if v < lo or v > hi:
-                            name = f"SPA-CH{ch}超限({header[col_idx][:12] if col_idx < len(header) else ''})"
-                            reasons[name]["count"] += 1
-                            reasons[name]["sns"].append(r["sn"])
-                            reasons[name]["stations"].add(r["file_source"])
-                            matched = True
-                except Exception:
-                    pass
-
-        # ── 频率扫描值超限 (cols 14+ ) ──
-        sweep = r.get("freq_sweep", [])
-        if sweep:
-            category_violations = defaultdict(int)
-            for idx, s in enumerate(sweep):
-                col_idx = idx + 14  # freq sweep starts at col 14 (0-indexed = index 0->col14)
-                if col_idx >= len(limits_lo) or col_idx >= len(limits_hi):
-                    break
-                lo_str = limits_lo[col_idx].strip()
-                hi_str = limits_hi[col_idx].strip()
-                if not lo_str or not hi_str:
-                    continue
-                try:
-                    lo_v = float(lo_str)
-                    hi_v = float(hi_str)
-                    v = float(s)
-                    lower = min(lo_v, hi_v)
-                    upper = max(lo_v, hi_v)
-                    if v < lower or v > upper:
-                        # Categorize by header name
-                        hdr_name = header[col_idx] if col_idx < len(header) else f"Col{col_idx}"
-                        # Extract category: "左主1标压_FR_Left_200" → "FR"
-                        if "FR_" in hdr_name:
-                            cat = "FR超限"
-                        elif "THD_" in hdr_name:
-                            cat = "THD超限"
-                        elif "Rub&Buzz" in hdr_name:
-                            cat = "R&B超限"
-                        elif "气密性" in hdr_name:
-                            cat = "气密性超限"
-                        elif "MIC" in hdr_name:
-                            cat = "MIC超限"
-                        else:
-                            cat = "频扫超限"
-                        category_violations[cat] += 1
-                except Exception:
-                    pass
-
-            for cat, cnt in category_violations.items():
-                if cnt > 0:
-                    reasons[cat]["count"] += 1
-                    reasons[cat]["sns"].append(r["sn"])
-                    reasons[cat]["stations"].add(r["file_source"])
-                    matched = True
-
-        # ── 电量管控 col 8 ──
-        col8 = r["_fields_raw"][8].strip() if len(r["_fields_raw"]) > 8 else ""
-        if col8:
-            try:
-                v8 = float(col8)
-                limit8 = limits_lo[8] if len(limits_lo) > 8 else ""
-                if limit8.startswith("<") and "," in limit8:
-                    parts = limit8.strip("<>").split(",")
-                    lo, hi = float(parts[0]), float(parts[1])
-                    if v8 < lo or v8 > hi:
-                        reasons["电量管控超限"]["count"] += 1
-                        reasons["电量管控超限"]["sns"].append(r["sn"])
-                        reasons["电量管控超限"]["stations"].add(r["file_source"])
-                        matched = True
-            except Exception:
-                pass
-
-        if not matched:
-            reasons["其他原因(ErrorCode空)"]["count"] += 1
-            reasons["其他原因(ErrorCode空)"]["sns"].append(r["sn"])
-            reasons["其他原因(ErrorCode空)"]["stations"].add(r["file_source"])
-
-    categories = []
-    for name, data in sorted(reasons.items(), key=lambda x: -x[1]["count"]):
-        categories.append({
-            "name": name,
-            "count": data["count"],
-            "pct": data["count"] / len(failed) * 100 if failed else 0,
-            "detail": ", ".join(sorted(data["stations"])) if data["stations"] else "",
-            "sns": data["sns"][:10],
+    # 全部SN列表(按站别分组)
+    all_sn_by_station = defaultdict(list)
+    for sn, v in sn_results.items():
+        all_sn_by_station[v["station"]].append({
+            "sn": sn, "passed": v["passed"],
+            "failed": v["failed_items"], "total": v["total_items"],
         })
 
-    by_station_reasons = defaultdict(lambda: defaultdict(int))
-    for name, data in reasons.items():
-        for st in data["stations"]:
-            by_station_reasons[st][name] += data["count"]
-
     return {
-        "categories": categories,
-        "by_station": {st: [{"reason": r, "count": c} for r, c in sorted(cnt.items(), key=lambda x: -x[1])]
-                       for st, cnt in by_station_reasons.items()},
-        "total_fail": len(failed),
+        "total_sn": total_sn,
+        "pass_sn": pass_sn,
+        "fail_sn": fail_sn,
+        "yield_rate": pass_sn/total_sn*100 if total_sn else 0,
+        "station_stats": dict(station_stats),
+        "failure_counter": dict(failure_counter),
+        "channel_failure": dict(channel_failure),
+        "fail_list": fail_list,
+        "all_sn_by_station": dict(all_sn_by_station),
+        "total_raw_rows": len(records),
     }
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 图表生成
-# ═══════════════════════════════════════════════════════════════════
-
-def _make_chart_overall_pie(analysis, out_path):
+# ═══════════════════════════════════════════════
+# 图表
+# ═══════════════════════════════════════════════
+def chart_station_yield(a, out):
     _get_font()
-    fig, ax = plt.subplots(figsize=(6, 5))
-    labels = ["PASS", "FAIL"]
-    sizes = [analysis["pass"], analysis["fail"]]
-    colors = [COLORS["pass"], COLORS["fail"]]
-    wedges, texts, autotexts = ax.pie(
-        sizes, labels=None, autopct="%1.1f%%", colors=colors,
-        startangle=90, pctdistance=0.6, explode=(0, 0.05),
-    )
-    for at in autotexts:
-        at.set_fontsize(13); at.set_fontweight("bold"); at.set_color("white")
-    ax.legend(wedges, [f"{l}  ({s}台)" for l, s in zip(labels, sizes)],
-              loc="lower center", ncol=2, frameon=False, prop={"size": 11})
-    ax.set_title(f"整体直通率\nPASS率: {analysis['pass_rate']:.1f}%  |  总数: {analysis['total']}  |  FAIL: {analysis['fail']}",
-                 fontsize=14, fontweight="bold", pad=20)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    sts = sorted(a["station_stats"].keys())
+    yields = [a["station_stats"][s]["pass"]/a["station_stats"][s]["total"]*100 for s in sts]
+    totals = [a["station_stats"][s]["total"] for s in sts]
+    fig, ax = plt.subplots(figsize=(max(8,len(sts)*1.5), 5))
+    bars = ax.bar(sts, yields, color=[C["pass"] if y>=97 else C["warn"] if y>=95 else C["fail"] for y in yields])
+    ax.set_ylabel("良率 (%)", fontsize=12)
+    ax.set_title("各站别良率", fontsize=14, fontweight="bold")
+    for bar, y, t in zip(bars, yields, totals):
+        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3, f"{y:.1f}%\n({t}台)", ha="center", fontsize=9, fontweight="bold")
+    ax.set_ylim(min(yields)-5, 102)
+    ax.axhline(y=95, color="#ccc", linestyle="--", linewidth=1)
+    plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
-
-def _make_chart_station_bars(analysis, out_path):
+def chart_failure_reasons(a, out):
     _get_font()
-    stations = sorted(analysis["by_station"].keys())
-    pass_vals = [analysis["by_station"][s]["pass"] for s in stations]
-    fail_vals = [analysis["by_station"][s]["fail"] for s in stations]
-    x = range(len(stations))
-    fig, ax = plt.subplots(figsize=(max(8, len(stations) * 1.8), 6))
-    ax.bar(x, pass_vals, 0.6, label="PASS", color=COLORS["bar_pass"], edgecolor="white")
-    ax.bar(x, fail_vals, 0.6, bottom=pass_vals, label="FAIL", color=COLORS["bar_fail"], edgecolor="white")
-    for i, st in enumerate(stations):
-        total = pass_vals[i] + fail_vals[i]
-        rate = fail_vals[i] / total * 100 if total else 0
-        ax.text(i, total + 1, f"{rate:.1f}%", ha="center", va="bottom",
-                fontsize=9, color=COLORS["fail"] if rate > 10 else "#555",
-                fontweight="bold" if rate > 10 else "normal")
-    ax.set_xticks(x); ax.set_xticklabels(stations, fontsize=11)
-    ax.set_ylabel("测试数量", fontsize=12)
-    ax.set_title("各站别 PASS / FAIL 分布", fontsize=14, fontweight="bold")
-    ax.legend(fontsize=11, frameon=False)
+    fc = a["failure_counter"]
+    if not fc: return
+    items = sorted(fc.items(), key=lambda x: -x[1])[:12]
+    labels = [k[:25] for k,_ in items]
+    counts = [v for _,v in items]
+    fig, ax = plt.subplots(figsize=(10, max(5, len(items)*0.4)))
+    colors = [C["fail"]]*len(items)
+    bars = ax.barh(range(len(items)), counts, color=colors, height=0.6)
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("失败SN数", fontsize=12)
+    ax.set_title("失败原因分布 (按SN去重)", fontsize=14, fontweight="bold")
+    ax.invert_yaxis()
+    for bar, c in zip(bars, counts):
+        ax.text(bar.get_width()+0.1, bar.get_y()+bar.get_height()/2, str(c), va="center", fontsize=9, fontweight="bold")
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+def chart_sn_fail_detail(a, out):
+    """各站别Top3高频失败项（分组柱状图）"""
+    _get_font()
+    ss = a["station_stats"]
+    if not ss: return
+
+    # 按站别统计失败项
+    station_fails = {}
+    for st in sorted(ss.keys()):
+        counter = Counter()
+        for sn_info in ss[st].get("failed_sns", []):
+            for item in sn_info["failed"]:
+                counter[item] += 1
+        station_fails[st] = counter
+
+    stations = sorted(station_fails.keys())
+    n = len(stations)
+    colors = ["#E53935", "#FB8C00", "#1E88E5"]
+    bar_w = 0.22
+
+    fig, ax = plt.subplots(figsize=(max(10, n*1.6), 6))
+    max_val = 1
+
+    for pos in range(3):
+        vals = []; labels = []
+        for st in stations:
+            items = station_fails[st].most_common(3)
+            if pos < len(items):
+                vals.append(items[pos][1])
+                labels.append(items[pos][0][:14])
+                max_val = max(max_val, items[pos][1])
+            else:
+                vals.append(0); labels.append("")
+
+        x_pos = [i + pos*bar_w for i in range(n)]
+        bars = ax.bar(x_pos, vals, bar_w, color=colors[pos],
+                       edgecolor="white", linewidth=0.3,
+                       label=["#1最多","#2","#3"][pos])
+        for i, (bar, lbl, v) in enumerate(zip(bars, labels, vals)):
+            if v > 0:
+                ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3,
+                        lbl, ha="center", va="bottom", fontsize=7, rotation=45, color="#333")
+
+    ax.set_xticks([i + bar_w for i in range(n)])
+    ax.set_xticklabels(stations, fontsize=11, fontweight="bold")
+    ax.set_ylabel("失败SN数", fontsize=12)
+    ax.set_title("各站别 Top3 高频失败项", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=8, ncol=3, loc="upper right")
     ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    ax.set_ylim(0, max(p + f for p, f in zip(pass_vals, fail_vals)) * 1.15)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    ax.set_ylim(0, max_val*1.5)
+    plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
-
-def _make_chart_hourly(analysis, out_path):
-    _get_font()
-    by_hour = analysis.get("by_hour", {})
-    if not by_hour:
-        return
-    hours = sorted(by_hour.keys())
-    rates = [by_hour[h]["pass"] / by_hour[h]["total"] * 100 if by_hour[h]["total"] else 0 for h in hours]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(hours, rates, marker="o", linewidth=2, markersize=8, color="#2196F3",
-            markerfacecolor="white", markeredgewidth=2)
-    ax.fill_between(range(len(hours)), rates, alpha=0.1, color="#2196F3")
-    ax.set_xlabel("时段（小时）", fontsize=12); ax.set_ylabel("直通率 (%)", fontsize=12)
-    ax.set_title("时段直通率趋势", fontsize=14, fontweight="bold")
-    ax.set_ylim(0, 105)
-    ax.axhline(y=analysis["pass_rate"], color=COLORS["highlight"], linestyle="--",
-               linewidth=1, label=f"整体直通率 {analysis['pass_rate']:.1f}%")
-    ax.legend(fontsize=10, frameon=False); ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _make_chart_cycle_time(analysis, out_path):
-    _get_font()
-    stations = sorted(analysis["by_station"].keys())
-    data = [analysis["by_station"][s]["cycle_times"] for s in stations if analysis["by_station"][s]["cycle_times"]]
-    labels = [s for s in stations if analysis["by_station"][s]["cycle_times"]]
-    if not data:
-        return
-    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.5), 5))
-    bp = ax.boxplot(data, patch_artist=True, showmeans=True,
-                    meanprops={"marker": "D", "markerfacecolor": COLORS["highlight"],
-                               "markeredgecolor": "black", "markersize": 6})
-    ax.set_xticklabels(labels)
-    for patch in bp["boxes"]:
-        patch.set_facecolor("#E3F2FD"); patch.set_edgecolor("#1976D2"); patch.set_linewidth(1.2)
-    ax.set_ylabel("节拍时间 (秒)", fontsize=12)
-    ax.set_title("各站别节拍时间分布", fontsize=14, fontweight="bold")
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _make_chart_fail_dist(analysis, out_path):
-    _get_font()
-    failed = analysis.get("failed_sns", [])
-    if not failed:
-        fig, ax = plt.subplots(figsize=(8, 2))
-        ax.text(0.5, 0.5, "无不良记录", ha="center", va="center", fontsize=16, color="#999")
-        ax.axis("off")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return
-    dist = Counter(sn["fail_count"] for sn in failed)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    cats = sorted(dist.keys())
-    counts = [dist[c] for c in cats]
-    bars = ax.bar([f"{c}站失败" for c in cats], counts,
-                  color=[COLORS["highlight"] if c >= 2 else COLORS["bar_fail"] for c in cats],
-                  edgecolor="white")
-    for bar, val in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                str(val), ha="center", va="bottom", fontsize=12, fontweight="bold")
-    ax.set_ylabel("SN 数量", fontsize=12)
-    ax.set_title(f"失败 SN 跨站分布（共 {len(failed)} 个 SN 失败）", fontsize=14, fontweight="bold")
-    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _make_chart_fail_matrix(analysis, out_path):
-    _get_font()
-    failed = analysis.get("failed_sns", [])
-    if not failed:
-        return
-    stations = sorted(analysis["by_station"].keys())
-    top = failed[:min(30, len(failed))]
-    matrix = [[1 if st in sn["stations_failed"] else 0 for st in stations] for sn in top]
-    sn_labels = [sn["sn"][-8:] for sn in top]
-    fig, ax = plt.subplots(figsize=(max(10, len(stations) * 1.5), max(6, len(top) * 0.35)))
-    ax.imshow(matrix, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=1)
-    ax.set_xticks(range(len(stations))); ax.set_xticklabels(stations, fontsize=9, rotation=45, ha="right")
-    ax.set_yticks(range(len(sn_labels))); ax.set_yticklabels(sn_labels, fontsize=7, family="monospace")
-    ax.set_title(f"失败 SN × 站别 热力图（前 {len(top)}）", fontsize=12, fontweight="bold")
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _make_chart_failure_reasons(failure_analysis, out_path):
-    """失败原因分布饼图"""
-    _get_font()
-    categories = failure_analysis.get("categories", [])
-    if not categories:
-        fig, ax = plt.subplots(figsize=(6, 2))
-        ax.text(0.5, 0.5, "无失败记录", ha="center", va="center", fontsize=16, color="#999")
-        ax.axis("off")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return
-
-    # Take top 8 categories, merge rest
-    top = categories[:8]
-    labels = [c["name"] for c in top]
-    sizes = [c["count"] for c in top]
-    rest = sum(c["count"] for c in categories[8:])
-    if rest > 0:
-        labels.append("其他")
-        sizes.append(rest)
-
-    colors_list = ["#F44336", "#FF9800", "#FF5722", "#E91E63",
-                   "#9C27B0", "#673AB7", "#3F51B5", "#2196F3", "#607D8B"]
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    wedges, texts, autotexts = ax.pie(
-        sizes, labels=None, autopct="%1.1f%%",
-        colors=colors_list[:len(sizes)], startangle=140,
-        pctdistance=0.75, explode=[0.03] * len(sizes),
-    )
-    for at in autotexts:
-        at.set_fontsize(10); at.set_fontweight("bold")
-
-    legend_labels = [f"{l} ({s})" for l, s in zip(labels, sizes)]
-    ax.legend(wedges, legend_labels, loc="center left",
-              bbox_to_anchor=(1, 0.5), frameon=False, prop={"size": 10})
-
-    ax.set_title(
-        f"失败原因分布（共 {failure_analysis['total_fail']} 次失败）",
-        fontsize=14, fontweight="bold", pad=20,
-    )
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# HTML 报告
-# ═══════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════
+# HTML
+# ═══════════════════════════════════════════════
 _HTML = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AT Audio Test 数据分析报告</title><style>
+<title>AT Audio Test 分析报告</title><style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,"Microsoft YaHei","PingFang SC",sans-serif;background:#f5f7fa;color:#333;padding:20px}}
+body{{font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f5f7fa;color:#333;padding:20px}}
 .container{{max-width:1200px;margin:0 auto}}
-h1{{text-align:center;color:#1a237e;margin-bottom:6px;font-size:28px}}
-.subtitle{{text-align:center;color:#78909c;margin-bottom:30px;font-size:14px}}
-.summary-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin-bottom:30px}}
-.card{{background:white;border-radius:10px;padding:20px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-.card .value{{font-size:36px;font-weight:700}}
-.card .label{{font-size:13px;color:#78909c;margin-top:4px}}
-.card.pass .value{{color:#4CAF50}}.card.fail .value{{color:#F44336}}
-.card.warn .value{{color:#FF9800}}.card.info .value{{color:#2196F3}}
-.chart-section{{background:white;border-radius:10px;padding:20px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-.chart-section h2{{color:#37474f;margin-bottom:15px;font-size:18px;border-left:4px solid #2196F3;padding-left:12px}}
-.chart-section img{{max-width:100%;height:auto;display:block;margin:0 auto}}
+h1{{text-align:center;color:#1a237e;margin-bottom:6px;font-size:26px}}
+.subtitle{{text-align:center;color:#78909c;margin-bottom:30px;font-size:13px}}
+.summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-bottom:30px}}
+.card{{background:white;border-radius:10px;padding:18px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
+.card .v{{font-size:34px;font-weight:700}}.card .l{{font-size:12px;color:#78909c;margin-top:4px}}
+.card.g .v{{color:#4CAF50}}.card.r .v{{color:#F44336}}.card.b .v{{color:#2196F3}}.card.o .v{{color:#FF9800}}
+.sec{{background:white;border-radius:10px;padding:20px;margin-bottom:18px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
+.sec h2{{color:#37474f;margin-bottom:15px;font-size:17px;border-left:4px solid #2196F3;padding-left:12px}}
+.sec img{{max-width:100%;height:auto;display:block;margin:0 auto}}
 table{{width:100%;border-collapse:collapse;font-size:13px}}
-th{{background:#263238;color:white;padding:10px 8px;text-align:left;font-weight:600}}
-td{{padding:8px;border-bottom:1px solid #eceff1}}
-tr:hover td{{background:#f5f5f5}}
+th{{background:#263238;color:white;padding:9px 8px;text-align:left;font-weight:600}}
+td{{padding:7px 8px;border-bottom:1px solid #eceff1}}tr:hover td{{background:#f5f5f5}}
 .badge{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;color:white}}
-.badge-pass{{background:#4CAF50}}.badge-fail{{background:#F44336}}.badge-warn{{background:#FF9800}}
-.note{{font-size:12px;color:#999;margin-top:6px}}
+.bg{{background:#4CAF50}}.br{{background:#F44336}}.bo{{background:#FF9800}}
 </style></head><body><div class="container">
-<h1>🔊 AT Audio Test 数据分析报告</h1>
-<p class="subtitle">生成时间: {report_time}  |  产品: {products}  |  数据日期: 2026-06-13</p>
-<div class="summary-cards">
-<div class="card info"><div class="value">{total}</div><div class="label">总测试数</div></div>
-<div class="card pass"><div class="value">{pass_count}</div><div class="label">PASS</div></div>
-<div class="card fail"><div class="value">{fail_count}</div><div class="label">FAIL</div></div>
-<div class="card {pass_rate_class}"><div class="value">{pass_rate:.1f}%</div><div class="label">直通率</div></div>
-<div class="card info"><div class="value">{total_stations}</div><div class="label">测试站别</div></div>
-<div class="card info"><div class="value">{multi_fail_count}</div><div class="label">多站失败SN</div></div>
+<h1>🔊 AT Audio Test 分析报告</h1>
+<p class="subtitle">{report_time} | 数据: {source_info} | 每SN取各项最终结果</p>
+<div class="summary">
+<div class="card b"><div class="v">{total_sn}</div><div class="l">测试总数(台)</div></div>
+<div class="card g"><div class="v">{pass_sn}</div><div class="l">PASS</div></div>
+<div class="card r"><div class="v">{fail_sn}</div><div class="l">FAIL</div></div>
+<div class="card {yc}"><div class="v">{yield_rate:.1f}%</div><div class="l">良率</div></div>
 </div>
-<div class="chart-section"><h2>📊 整体直通率</h2><img src="chart_overall_pie.png" alt="直通率饼图"></div>
-<div class="chart-section"><h2>📊 各站别 PASS / FAIL 分布</h2><img src="chart_station_bars.png" alt="站别分布"></div>
-<div class="chart-section"><h2>📊 时段直通率趋势</h2><img src="chart_hourly_rate.png" alt="时段趋势"></div>
-<div class="chart-section"><h2>📊 节拍时间分布</h2><img src="chart_cycle_time.png" alt="节拍分布"></div>
-<div class="chart-section"><h2>📊 不良 SN 跨站分布</h2><img src="chart_fail_dist.png" alt="不良分布"></div>
-<div class="chart-section"><h2>📊 失败 SN × 站别 矩阵（前30）</h2><img src="chart_fail_matrix.png" alt="失败矩阵"></div>
-<div class="chart-section"><h2>📋 各站别统计明细</h2><table>
-<tr><th>站别</th><th>总数</th><th>PASS</th><th>FAIL</th><th>不良率</th><th>平均节拍(s)</th><th>最小节拍</th><th>最大节拍</th></tr>
-{station_table_rows}</table></div>
-<div class="chart-section"><h2>🔴 跨站重复失败 SN（{multi_fail_count} 个）</h2>
-{multi_fail_table}<p class="note">⚠ 以下 SN 在多个站别均测试失败，建议优先排查。</p></div>
-<div class="chart-section"><h2>🔍 失败原因透视分析</h2>
-<img src="chart_failure_reasons.png" alt="失败原因分布" style="max-width:70%">
-<table><tr><th>失败原因</th><th>次数</th><th>占比</th><th>涉及站别</th><th>典型SN</th></tr>
-{failure_reason_rows}</table></div>
-<div class="chart-section"><h2>📋 全部失败 SN 清单（{all_fail_count} 个）</h2>
-{all_fail_table}</div>
+<div class="sec"><h2>📊 各站别良率</h2><img src="chart_station_yield.png"></div>
+<div class="sec"><h2>📋 各站别统计</h2><table>
+<tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th></tr>{station_table}</table></div>
+<div class="sec"><h2>📊 失败原因</h2><img src="chart_failure_reasons.png"></div>
+<div class="sec"><h2>📊 各站别高频失败项</h2><img src="chart_sn_fail_detail.png"></div>
+<div class="sec"><h2>🔴 失败SN明细</h2><table>
+<tr><th>SN</th><th>站别</th><th>失败项数</th><th>失败测试项</th></tr>{sn_table}</table></div>
 </div></body></html>"""
 
-
-def generate_html_report(analysis, failure_analysis, chart_dir, out_path):
-    _get_font()
+def make_html(a, out_dir, out_path, source_info=""):
     # Station table
-    station_rows = []
-    for st in sorted(analysis["by_station"].keys()):
-        d = analysis["by_station"][st]
-        total = d["total"]
-        rate = d["fail"] / total * 100 if total else 0
-        cts = d["cycle_times"]
-        avg_ct = f"{sum(cts)/len(cts):.1f}" if cts else "-"
-        min_ct = f"{min(cts):.1f}" if cts else "-"
-        max_ct = f"{max(cts):.1f}" if cts else "-"
-        rc = "badge-pass" if rate < 3 else "badge-warn" if rate < 10 else "badge-fail"
-        station_rows.append(
-            f"<tr><td><strong>{st}</strong></td><td>{total}</td><td>{d['pass']}</td><td>{d['fail']}</td>"
-            f"<td><span class='badge {rc}'>{rate:.1f}%</span></td>"
-            f"<td>{avg_ct}</td><td>{min_ct}</td><td>{max_ct}</td></tr>"
-        )
+    st_rows = []
+    for s in sorted(a["station_stats"].keys()):
+        d = a["station_stats"][s]
+        r = d["pass"]/d["total"]*100 if d["total"] else 0
+        cls = "bg" if r>=97 else "bo" if r>=95 else "br"
+        st_rows.append(f"<tr><td><strong>{s}</strong></td><td>{d['total']}</td>"
+                       f"<td>{d['pass']}</td><td>{d['fail']}</td><td><span class='badge {cls}'>{r:.1f}%</span></td></tr>")
+    # SN table
+    sn_rows = []
+    for s in a["fail_list"]:
+        items = ", ".join(s["failed"][:5])
+        sn_rows.append(f"<tr><td><code>{s['sn']}</code></td><td>{s['station']}</td>"
+                       f"<td>{len(s['failed'])}/{s['total']}</td><td style='font-size:11px'>{items}</td></tr>")
 
-    # Multi-fail table
-    multi_fail = analysis.get("multi_fail_sns", [])
-    if multi_fail:
-        multi_rows = []
-        for sn_info in multi_fail[:50]:
-            multi_rows.append(
-                f"<tr><td><code>{sn_info['sn']}</code></td>"
-                f"<td><span class='badge badge-fail'>{sn_info['fail_count']}站</span></td>"
-                f"<td>{', '.join(sn_info['stations_failed'])}</td></tr>"
-            )
-        multi_table = (
-            "<table><tr><th>SN</th><th>失败站数</th><th>失败站别</th></tr>"
-            + "".join(multi_rows) + "</table>"
-        )
-    else:
-        multi_table = "<p>✅ 无跨站重复失败</p>"
-
-    # All fail table
-    all_failed = analysis.get("failed_sns", [])
-    if all_failed:
-        fail_rows = []
-        for sn_info in all_failed[:100]:
-            stations = ", ".join(f"{r['station']}({r['result']})" for r in sn_info["results"])
-            fail_rows.append(
-                f"<tr><td><code>{sn_info['sn']}</code></td>"
-                f"<td>{sn_info['fail_count']}</td><td style='font-size:11px'>{stations}</td></tr>"
-            )
-        all_fail_table = (
-            "<table><tr><th>SN</th><th>失败次数</th><th>详情</th></tr>"
-            + "".join(fail_rows) + "</table>"
-        )
-        if len(all_failed) > 100:
-            all_fail_table += f"<p class='note'>... 共 {len(all_failed)} 条，仅显示前 100 条</p>"
-    else:
-        all_fail_table = "<p>✅ 无失败记录</p>"
-
-    # Failure reason rows
-    fr_categories = failure_analysis.get("categories", [])
-    if fr_categories:
-        fr_rows = []
-        for c in fr_categories:
-            sns = ", ".join(c.get("sns", [])[:3]) if c.get("sns") else "—"
-            fr_rows.append(
-                f"<tr><td>{c['name']}</td><td>{c['count']}</td>"
-                f"<td>{c['pct']:.1f}%</td><td>{c['detail']}</td>"
-                f"<td style='font-size:11px'><code>{sns}</code></td></tr>"
-            )
-        failure_reason_rows = "".join(fr_rows)
-    else:
-        failure_reason_rows = "<tr><td colspan='5'>✅ 无失败记录</td></tr>"
-
+    yc = "g" if a["yield_rate"]>=97 else "o" if a["yield_rate"]>=95 else "r"
     html = _HTML.format(
         report_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        products=", ".join(analysis.get("products", ["未知"])),
-        total=analysis["total"], pass_count=analysis["pass"], fail_count=analysis["fail"],
-        pass_rate=analysis["pass_rate"],
-        pass_rate_class="pass" if analysis["pass_rate"] >= 95 else "warn" if analysis["pass_rate"] >= 85 else "fail",
-        total_stations=analysis["total_stations"],
-        multi_fail_count=len(multi_fail), all_fail_count=len(all_failed),
-        station_table_rows="".join(station_rows),
-        multi_fail_table=multi_table, all_fail_table=all_fail_table,
-        failure_reason_rows=failure_reason_rows,
+        source_info=source_info,
+        total_sn=a["total_sn"], pass_sn=a["pass_sn"], fail_sn=a["fail_sn"],
+        yield_rate=a["yield_rate"], yc=yc,
+        station_table="".join(st_rows), sn_table="".join(sn_rows),
     )
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    with open(out_path, "w", encoding="utf-8") as f: f.write(html)
     return out_path
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 工具函数
-# ═══════════════════════════════════════════════════════════════════
-
-def open_with_default(path):
-    if not path or not os.path.exists(path):
-        return
+# ═══════════════════════════════════════════════
+# GUI
+# ═══════════════════════════════════════════════
+def _open_with_default(path):
+    if not path or not os.path.exists(path): return
     try:
-        if sys.platform == "win32": os.startfile(path)
-        elif sys.platform == "darwin": subprocess.run(["open", path])
-        else: subprocess.run(["xdg-open", path])
-    except Exception:
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 入口（GUI 延迟加载，分析引擎无 tkinter 也可单独使用）
-# ═══════════════════════════════════════════════════════════════════
-
-# GUI 样式（模块级常量，_run_gui 引用）
-STYLE = {
-    "bg": "#f0f2f5", "fg": "#1a1a2e", "card_bg": "#ffffff",
-    "accent": "#2196F3", "accent_hover": "#1976D2",
-    "success": "#4CAF50", "danger": "#F44336", "warning": "#FF9800",
-    "border": "#e0e0e0", "text_secondary": "#78909c",
-    "input_bg": "#ffffff", "tree_bg": "#ffffff", "tree_sel": "#E3F2FD",
-    "progress_bg": "#e0e0e0",
-}
-
+        if sys.platform=="win32": os.startfile(path)
+        elif sys.platform=="darwin": subprocess.run(["open",path])
+        else: subprocess.run(["xdg-open",path])
+    except: pass
 
 def _run_gui():
-    """延迟导入 tkinter，仅 GUI 模式需要"""
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
     class App:
         def __init__(self, root):
             self.root = root
-            self.root.title("AT Audio Test 数据分析工具")
-            self.root.geometry("1100x750")
-            self.root.minsize(900, 600)
-            self.root.configure(bg=STYLE["bg"])
-
-            self.source_path = tk.StringVar()
-            self.output_dir = tk.StringVar(value=os.path.join(os.getcwd(), "at_report"))
-            self.status_text = tk.StringVar(value="就绪 — 请选择数据源文件或文件夹")
-            self.progress_var = tk.DoubleVar(value=0)
-
+            root.title("AT Audio Test 分析工具 v3.2")
+            root.geometry("1050x700"); root.minsize(850,550)
+            root.configure(bg=STYLE["bg"])
+            self.src = tk.StringVar()
+            self.out = tk.StringVar(value=os.path.join(os.getcwd(),"at_report_v3"))
+            self.status = tk.StringVar(value="就绪 — 选择数据源（ZIP/文件夹），点开始分析")
+            self.prog = tk.DoubleVar(value=0)
             self.opt_charts = tk.BooleanVar(value=True)
             self.opt_html = tk.BooleanVar(value=True)
             self.opt_csv = tk.BooleanVar(value=True)
-            self.opt_auto_open = tk.BooleanVar(value=True)
+            self.opt_open = tk.BooleanVar(value=True)
+            self.records = None; self.analysis = None; self.html_path = None; self.running = False
+            self._build()
+            root.update_idletasks()
+            w,h = root.winfo_width(), root.winfo_height()
+            sw,sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
 
-            self.analysis_result = None
-            self.records = None
-            self.report_html_path = None
-            self.is_running = False
-
-            self._apply_theme()
-            self._build_ui()
-            self._center_window()
-
-        def _apply_theme(self):
-            style = ttk.Style(self.root)
-            try: style.theme_use("clam")
-            except tk.TclError: pass
-            style.configure("TProgressbar", background=STYLE["accent"], troughcolor=STYLE["progress_bg"])
-            style.configure("Treeview", background=STYLE["tree_bg"], foreground=STYLE["fg"],
-                            fieldbackground=STYLE["tree_bg"], font=("Consolas", 10), rowheight=26)
-            style.configure("Treeview.Heading", background=STYLE["card_bg"], foreground=STYLE["fg"],
-                            font=("Microsoft YaHei", 9, "bold"), padding=5)
-            style.map("Treeview", background=[("selected", STYLE["tree_sel"])])
-
-        def _center_window(self):
-            self.root.update_idletasks()
-            w, h = self.root.winfo_width(), self.root.winfo_height()
-            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            self.root.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
-
-        def _build_ui(self):
-            hdr = tk.Frame(self.root, bg=STYLE["accent"], height=56)
+        def _build(self):
+            # Header
+            hdr = tk.Frame(self.root, bg=STYLE["accent"], height=48)
             hdr.pack(fill="x"); hdr.pack_propagate(False)
-            tk.Label(hdr, text="🔊  AT Audio Test 数据分析工具", bg=STYLE["accent"], fg="white",
-                     font=("Microsoft YaHei", 16, "bold")).pack(side="left", padx=20, pady=12)
-            tk.Label(hdr, text="v2.0 单文件版", bg=STYLE["accent"],
-                     fg="#B0BEC5", font=("Microsoft YaHei", 9)).pack(side="right", padx=20, pady=12)
+            tk.Label(hdr, text="🔊 AT Audio Test 分析工具 v3.2", bg=STYLE["accent"], fg="white",
+                     font=("Microsoft YaHei",15,"bold")).pack(side="left", padx=20, pady=10)
 
             main = tk.Frame(self.root, bg=STYLE["bg"])
-            main.pack(fill="both", expand=True, padx=15, pady=(15, 0))
+            main.pack(fill="both", expand=True, padx=15, pady=(10,0))
+            left = tk.Frame(main, bg=STYLE["bg"]); left.pack(side="left", fill="y", padx=(0,10))
 
-            left = tk.Frame(main, bg=STYLE["bg"]); left.pack(side="left", fill="y", padx=(0, 10))
-            self._build_source_section(left)
-            self._build_output_section(left)
-            self._build_options_section(left)
-            self._build_action_button(left)
+            # Source
+            f1 = tk.LabelFrame(left, text="📁 数据源", bg=STYLE["card_bg"], fg=STYLE["fg"],
+                               font=("Microsoft YaHei",11,"bold"), padx=12, pady=10, relief="groove", bd=1)
+            f1.pack(fill="x", pady=(0,8))
+            r1 = tk.Frame(f1, bg=STYLE["card_bg"]); r1.pack(fill="x")
+            self.se = tk.Entry(r1, textvariable=self.src, font=("Consolas",10), bg=STYLE["input_bg"], relief="solid", bd=1)
+            self.se.pack(side="left", fill="x", expand=True, ipady=3)
+            tk.Button(r1, text="📂 选择", command=self._pick_src, bg=STYLE["accent"], fg="white",
+                      font=("Microsoft YaHei",9), relief="flat", padx=12, pady=3, cursor="hand2").pack(side="left", padx=(6,0))
+            r2 = tk.Frame(f1, bg=STYLE["card_bg"]); r2.pack(fill="x", pady=(6,0))
+            for t,c in [("📦 ZIP","zip"),("📁 文件夹","dir"),("📄 单文件","file")]:
+                tk.Button(r2, text=t, command=lambda m=c: self._pick_src(m), bg="#ECEFF1", fg=STYLE["fg"],
+                          font=("Microsoft YaHei",9), relief="flat", padx=10, pady=2, cursor="hand2").pack(side="left", padx=(0,6))
 
+            # Output
+            f2 = tk.LabelFrame(left, text="📂 输出目录", bg=STYLE["card_bg"], fg=STYLE["fg"],
+                               font=("Microsoft YaHei",11,"bold"), padx=12, pady=10, relief="groove", bd=1)
+            f2.pack(fill="x", pady=(0,8))
+            r = tk.Frame(f2, bg=STYLE["card_bg"]); r.pack(fill="x")
+            self.oe = tk.Entry(r, textvariable=self.out, font=("Consolas",10), bg=STYLE["input_bg"], relief="solid", bd=1)
+            self.oe.pack(side="left", fill="x", expand=True, ipady=3)
+            tk.Button(r, text="📂 选择", command=self._pick_out, bg=STYLE["accent"], fg="white",
+                      font=("Microsoft YaHei",9), relief="flat", padx=12, pady=3, cursor="hand2").pack(side="left", padx=(6,0))
+
+            # Options
+            f3 = tk.LabelFrame(left, text="⚙️ 输出", bg=STYLE["card_bg"], fg=STYLE["fg"],
+                               font=("Microsoft YaHei",11,"bold"), padx=12, pady=10, relief="groove", bd=1)
+            f3.pack(fill="x", pady=(0,8))
+            for v,t in [(self.opt_charts,"PNG图表"),(self.opt_html,"HTML报告"),(self.opt_csv,"CSV明细"),(self.opt_open,"自动打开")]:
+                tk.Checkbutton(f3, text=t, variable=v, bg=STYLE["card_bg"], font=("Microsoft YaHei",10),
+                               activebackground=STYLE["card_bg"], selectcolor=STYLE["card_bg"]).pack(anchor="w", pady=1)
+
+            # Run
+            self.btn = tk.Button(left, text="▶  开始分析", command=self._start, bg=STYLE["accent"], fg="white",
+                                  font=("Microsoft YaHei",12,"bold"), relief="flat", padx=30, pady=10, cursor="hand2")
+            self.btn.pack(fill="x", pady=(5,0))
+
+            # Right panel
             right = tk.Frame(main, bg=STYLE["bg"]); right.pack(side="left", fill="both", expand=True)
-            self._build_result_section(right)
 
-            sbar = tk.Frame(self.root, bg=STYLE["card_bg"], height=34)
-            sbar.pack(fill="x", side="bottom", pady=(10, 0)); sbar.pack_propagate(False)
-            tk.Label(sbar, textvariable=self.status_text, bg=STYLE["card_bg"],
-                     fg=STYLE["text_secondary"], font=("Microsoft YaHei", 9), anchor="w"
-                     ).pack(side="left", fill="x", padx=15, pady=6)
-            self.progress_bar = ttk.Progressbar(sbar, variable=self.progress_var, mode="determinate", length=200)
-            self.progress_bar.pack(side="right", padx=15, pady=6)
-
-        def _build_source_section(self, parent):
-            frm = tk.LabelFrame(parent, text="📁  数据源", bg=STYLE["card_bg"], fg=STYLE["fg"],
-                                font=("Microsoft YaHei", 11, "bold"), padx=15, pady=12, relief="groove", bd=1)
-            frm.pack(fill="x", pady=(0, 10))
-            r1 = tk.Frame(frm, bg=STYLE["card_bg"]); r1.pack(fill="x", pady=(5, 8))
-            self.src_entry = tk.Entry(r1, textvariable=self.source_path, font=("Consolas", 10),
-                                       bg=STYLE["input_bg"], relief="solid", bd=1)
-            self.src_entry.pack(side="left", fill="x", expand=True, ipady=4)
-            tk.Button(r1, text="📂 选择...", command=self._browse_source,
-                      bg=STYLE["accent"], fg="white", font=("Microsoft YaHei", 9),
-                      relief="flat", padx=15, pady=4, cursor="hand2",
-                      activebackground=STYLE["accent_hover"]).pack(side="left", padx=(8, 0))
-            r2 = tk.Frame(frm, bg=STYLE["card_bg"]); r2.pack(fill="x")
-            for txt, cmd in [("📦 选ZIP", "zip"), ("📁 选文件夹", "dir"), ("📄 选单文件", "file")]:
-                tk.Button(r2, text=txt, command=lambda c=cmd: self._browse_source(c),
-                          bg="#ECEFF1", fg=STYLE["fg"], font=("Microsoft YaHei", 9),
-                          relief="flat", padx=12, pady=3, cursor="hand2").pack(side="left", padx=(0, 8))
-            tk.Label(frm, text="支持 .zip / .xls / .txt (TSV格式)   |   加密文件请先另存为 .txt",
-                     bg=STYLE["card_bg"], fg=STYLE["text_secondary"], font=("Microsoft YaHei", 8)
-                     ).pack(anchor="w", pady=(8, 0))
-
-        def _build_output_section(self, parent):
-            frm = tk.LabelFrame(parent, text="📂  输出目录", bg=STYLE["card_bg"], fg=STYLE["fg"],
-                                font=("Microsoft YaHei", 11, "bold"), padx=15, pady=12, relief="groove", bd=1)
-            frm.pack(fill="x", pady=(0, 10))
-            r = tk.Frame(frm, bg=STYLE["card_bg"]); r.pack(fill="x")
-            self.out_entry = tk.Entry(r, textvariable=self.output_dir, font=("Consolas", 10),
-                                       bg=STYLE["input_bg"], relief="solid", bd=1)
-            self.out_entry.pack(side="left", fill="x", expand=True, ipady=4)
-            tk.Button(r, text="📂 选择...", command=self._browse_output,
-                      bg=STYLE["accent"], fg="white", font=("Microsoft YaHei", 9),
-                      relief="flat", padx=15, pady=4, cursor="hand2",
-                      activebackground=STYLE["accent_hover"]).pack(side="left", padx=(8, 0))
-
-        def _build_options_section(self, parent):
-            frm = tk.LabelFrame(parent, text="⚙️  输出选项", bg=STYLE["card_bg"], fg=STYLE["fg"],
-                                font=("Microsoft YaHei", 11, "bold"), padx=15, pady=12, relief="groove", bd=1)
-            frm.pack(fill="x", pady=(0, 10))
-            for var, txt in [(self.opt_charts, "生成 PNG 图表（6张）"),
-                             (self.opt_html, "生成 HTML 汇总报告"),
-                             (self.opt_csv, "导出 CSV 明细"),
-                             (self.opt_auto_open, "完成后自动打开报告")]:
-                tk.Checkbutton(frm, text=txt, variable=var, bg=STYLE["card_bg"],
-                               font=("Microsoft YaHei", 10), activebackground=STYLE["card_bg"],
-                               selectcolor=STYLE["card_bg"]).pack(anchor="w", pady=2)
-
-        def _build_action_button(self, parent):
-            frm = tk.Frame(parent, bg=STYLE["bg"]); frm.pack(fill="x", pady=(5, 10))
-            self.run_btn = tk.Button(frm, text="▶  开始分析", command=self._start_analysis,
-                                      bg=STYLE["accent"], fg="white",
-                                      font=("Microsoft YaHei", 12, "bold"),
-                                      relief="flat", padx=30, pady=10, cursor="hand2",
-                                      activebackground=STYLE["accent_hover"])
-            self.run_btn.pack(fill="x", expand=True)
-
-        def _build_result_section(self, parent):
-            cards_frm = tk.Frame(parent, bg=STYLE["bg"]); cards_frm.pack(fill="x", pady=(0, 8))
+            # Summary cards
+            cards = tk.Frame(right, bg=STYLE["bg"]); cards.pack(fill="x", pady=(0,6))
             self.cards = {}
-            for i, (key, label, color) in enumerate([
-                ("total", "总测试数", "#2196F3"), ("pass", "PASS", "#4CAF50"),
-                ("fail", "FAIL", "#F44336"), ("rate", "直通率", "#FF9800"),
-            ]):
-                card = tk.Frame(cards_frm, bg=STYLE["card_bg"], relief="solid", bd=1, padx=10, pady=10)
-                card.grid(row=0, column=i, padx=4, sticky="nsew")
-                cards_frm.grid_columnconfigure(i, weight=1)
-                self.cards[key] = {
-                    "val": tk.Label(card, text="—", bg=STYLE["card_bg"], fg=color,
-                                    font=("Consolas", 22, "bold")),
-                    "lbl": tk.Label(card, text=label, bg=STYLE["card_bg"],
-                                    fg=STYLE["text_secondary"], font=("Microsoft YaHei", 9)),
+            for i,(k,label,color) in enumerate([
+                ("total","测试总数","#2196F3"),("pass","PASS","#4CAF50"),
+                ("fail","FAIL","#F44336"),("yield","良率","#FF9800")]):
+                cd = tk.Frame(cards, bg=STYLE["card_bg"], relief="solid", bd=1, padx=8, pady=8)
+                cd.grid(row=0, column=i, padx=3, sticky="nsew"); cards.grid_columnconfigure(i, weight=1)
+                self.cards[k] = {
+                    "v": tk.Label(cd, text="—", bg=STYLE["card_bg"], fg=color, font=("Consolas",20,"bold")),
+                    "l": tk.Label(cd, text=label, bg=STYLE["card_bg"], fg=STYLE["text_secondary"], font=("Microsoft YaHei",9))
                 }
-                self.cards[key]["val"].pack(); self.cards[key]["lbl"].pack()
+                self.cards[k]["v"].pack(); self.cards[k]["l"].pack()
 
-            tbl_frm = tk.Frame(parent, bg=STYLE["bg"]); tbl_frm.pack(fill="both", expand=True)
+            # Notebook tabs
+            nb = ttk.Notebook(right); nb.pack(fill="both", expand=True)
 
-            sframe = tk.LabelFrame(tbl_frm, text="📊  各站别统计", bg=STYLE["card_bg"],
-                                    fg=STYLE["fg"], font=("Microsoft YaHei", 10, "bold"),
-                                    padx=8, pady=8, relief="groove", bd=1)
-            sframe.pack(side="left", fill="both", expand=True, padx=(0, 4))
-            self.station_tree = ttk.Treeview(sframe, columns=("station", "total", "pass", "fail", "rate", "avg_ct"),
-                                              show="headings", height=8)
-            for col, txt, w in [("station", "站别", 70), ("total", "总数", 55), ("pass", "PASS", 55),
-                                ("fail", "FAIL", 55), ("rate", "不良率", 75), ("avg_ct", "平均节拍", 75)]:
-                self.station_tree.heading(col, text=txt)
-                self.station_tree.column(col, width=w, anchor="center")
-            self.station_tree.pack(fill="both", expand=True)
-            for tag, color in [("high_fail", "#F44336"), ("mid_fail", "#FF9800"), ("low_fail", "#4CAF50")]:
-                self.station_tree.tag_configure(tag, foreground=color)
+            # Tab1: Station stats
+            t1 = tk.Frame(nb, bg=STYLE["card_bg"]); nb.add(t1, text="📊 站别统计")
+            self.st_tree = ttk.Treeview(t1, columns=("st","total","pass","fail","yield"), show="headings", height=14)
+            self.st_tree.heading("st", text="站别"); self.st_tree.column("st", width=80)
+            self.st_tree.heading("total", text="测试数"); self.st_tree.column("total", width=70, anchor="center")
+            self.st_tree.heading("pass", text="PASS"); self.st_tree.column("pass", width=70, anchor="center")
+            self.st_tree.heading("fail", text="FAIL"); self.st_tree.column("fail", width=70, anchor="center")
+            self.st_tree.heading("yield", text="良率"); self.st_tree.column("yield", width=80, anchor="center")
+            self.st_tree.pack(fill="both", expand=True)
+            for tag,c in [("good","#4CAF50"),("warn","#FF9800"),("bad","#F44336")]:
+                self.st_tree.tag_configure(tag, foreground=c)
 
-            fframe = tk.LabelFrame(tbl_frm, text="🔴  跨站重复失败 SN", bg=STYLE["card_bg"],
-                                    fg=STYLE["fg"], font=("Microsoft YaHei", 10, "bold"),
-                                    padx=8, pady=8, relief="groove", bd=1)
-            fframe.pack(side="left", fill="both", expand=True, padx=(4, 0))
-            self.fail_tree = ttk.Treeview(fframe, columns=("sn", "count", "stations"),
-                                           show="headings", height=8)
-            self.fail_tree.heading("sn", text="SN"); self.fail_tree.column("sn", width=160)
-            self.fail_tree.heading("count", text="失败站数"); self.fail_tree.column("count", width=70, anchor="center")
-            self.fail_tree.heading("stations", text="失败站别"); self.fail_tree.column("stations", width=150)
-            self.fail_tree.pack(fill="both", expand=True)
-            self.fail_tree.tag_configure("critical", foreground="#F44336", font=("Consolas", 10, "bold"))
+            # Tab2: Failure reasons
+            t2 = tk.Frame(nb, bg=STYLE["card_bg"]); nb.add(t2, text="🔍 失败原因")
+            self.fr_tree = ttk.Treeview(t2, columns=("reason","count","pct"), show="headings", height=14)
+            self.fr_tree.heading("reason", text="失败测试项"); self.fr_tree.column("reason", width=280)
+            self.fr_tree.heading("count", text="失败SN数"); self.fr_tree.column("count", width=90, anchor="center")
+            self.fr_tree.heading("pct", text="占比"); self.fr_tree.column("pct", width=80, anchor="center")
+            self.fr_tree.pack(fill="both", expand=True)
 
-            # Failure reasons table (below the two above)
-            rframe = tk.LabelFrame(parent, text="🔍  失败原因透视", bg=STYLE["card_bg"],
-                                    fg=STYLE["fg"], font=("Microsoft YaHei", 10, "bold"),
-                                    padx=8, pady=8, relief="groove", bd=1)
-            rframe.pack(fill="x", pady=(4, 0))
-            self.reason_tree = ttk.Treeview(rframe, columns=("reason", "count", "pct", "detail"),
-                                             show="headings", height=5)
-            self.reason_tree.heading("reason", text="失败原因"); self.reason_tree.column("reason", width=200)
-            self.reason_tree.heading("count", text="次数"); self.reason_tree.column("count", width=60, anchor="center")
-            self.reason_tree.heading("pct", text="占比"); self.reason_tree.column("pct", width=60, anchor="center")
-            self.reason_tree.heading("detail", text="涉及站别"); self.reason_tree.column("detail", width=200)
-            self.reason_tree.pack(fill="x")
-            for tag, color in [("high", "#F44336"), ("mid", "#FF9800"), ("low", "#2196F3")]:
-                self.reason_tree.tag_configure(tag, foreground=color)
+            # Tab3: Failed SNs
+            t3 = tk.Frame(nb, bg=STYLE["card_bg"]); nb.add(t3, text="🔴 失败SN")
+            self.sn_tree = ttk.Treeview(t3, columns=("sn","st","cnt","items"), show="headings", height=14)
+            self.sn_tree.heading("sn", text="SN"); self.sn_tree.column("sn", width=170)
+            self.sn_tree.heading("st", text="站别"); self.sn_tree.column("st", width=60, anchor="center")
+            self.sn_tree.heading("cnt", text="失败项"); self.sn_tree.column("cnt", width=70, anchor="center")
+            self.sn_tree.heading("items", text="失败详情"); self.sn_tree.column("items", width=350)
+            self.sn_tree.pack(fill="both", expand=True)
+            self.sn_tree.tag_configure("critical", foreground="#F44336")
 
-            btns = tk.Frame(parent, bg=STYLE["bg"]); btns.pack(fill="x", pady=(8, 0))
-            self.btn_report = tk.Button(btns, text="📄 打开 HTML 报告", command=self._open_report,
-                                         bg=STYLE["success"], fg="white", font=("Microsoft YaHei", 10),
-                                         relief="flat", padx=18, pady=6, cursor="hand2", state="disabled")
-            self.btn_report.pack(side="left", padx=(0, 8))
-            self.btn_folder = tk.Button(btns, text="📂 打开输出目录", command=self._open_folder,
-                                         bg="#ECEFF1", fg=STYLE["fg"], font=("Microsoft YaHei", 10),
-                                         relief="flat", padx=18, pady=6, cursor="hand2", state="disabled")
-            self.btn_folder.pack(side="left", padx=(0, 8))
-            self.btn_csv = tk.Button(btns, text="💾 另存 CSV", command=self._save_csv,
-                                      bg="#ECEFF1", fg=STYLE["fg"], font=("Microsoft YaHei", 10),
-                                      relief="flat", padx=18, pady=6, cursor="hand2", state="disabled")
-            self.btn_csv.pack(side="left")
+            # Tab4: All SNs by station
+            t4 = tk.Frame(nb, bg=STYLE["card_bg"]); nb.add(t4, text="📋 全部SN")
+            # Use a sub-notebook for per-station tabs
+            self.all_nb = ttk.Notebook(t4)
+            self.all_nb.pack(fill="both", expand=True)
+            self.all_trees = {}  # station -> treeview
 
-        # ── Events ──
-        def _browse_source(self, mode=None):
-            if mode == "zip":
-                path = filedialog.askopenfilename(title="选择 AT 数据压缩包",
-                    filetypes=[("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")])
-            elif mode == "dir":
-                path = filedialog.askdirectory(title="选择数据文件夹")
-            elif mode == "file":
-                path = filedialog.askopenfilename(title="选择数据文件",
-                    filetypes=[("数据文件", "*.xls;*.txt"), ("所有文件", "*.*")])
-            else:
-                path = filedialog.askopenfilename(title="选择数据源",
-                    filetypes=[("支持格式", "*.zip;*.xls;*.txt"), ("所有文件", "*.*")])
-                if not path:
-                    path = filedialog.askdirectory(title="或者选择数据文件夹")
-            if path:
-                self.source_path.set(path)
-                self.status_text.set(f"已选择: {os.path.basename(path)}")
+            # Bottom
+            btns = tk.Frame(right, bg=STYLE["bg"]); btns.pack(fill="x", pady=(6,0))
+            self.br = tk.Button(btns, text="📄 打开报告", command=self._open_r, bg=STYLE["success"], fg="white",
+                                 font=("Microsoft YaHei",10), relief="flat", padx=16, pady=5, state="disabled")
+            self.br.pack(side="left", padx=(0,6))
+            self.bf = tk.Button(btns, text="📂 输出目录", command=self._open_f, bg="#ECEFF1", fg=STYLE["fg"],
+                                 font=("Microsoft YaHei",10), relief="flat", padx=16, pady=5, state="disabled")
+            self.bf.pack(side="left", padx=(0,6))
 
-        def _browse_output(self):
-            path = filedialog.askdirectory(title="选择输出目录", initialdir=self.output_dir.get())
-            if path:
-                self.output_dir.set(path)
+            # Status bar
+            sbar = tk.Frame(self.root, bg=STYLE["card_bg"], height=30)
+            sbar.pack(fill="x", side="bottom", pady=(8,0)); sbar.pack_propagate(False)
+            tk.Label(sbar, textvariable=self.status, bg=STYLE["card_bg"], fg=STYLE["text_secondary"],
+                     font=("Microsoft YaHei",9), anchor="w").pack(side="left", fill="x", padx=12, pady=4)
+            self.pb = ttk.Progressbar(sbar, variable=self.prog, mode="determinate", length=180)
+            self.pb.pack(side="right", padx=12, pady=4)
 
-        def _start_analysis(self):
-            source = self.source_path.get().strip()
-            if not source:
-                messagebox.showwarning("提示", "请先选择数据源。"); return
-            if not os.path.exists(source):
-                messagebox.showerror("错误", f"路径不存在:\n{source}"); return
-            if self.is_running:
-                messagebox.showinfo("提示", "分析正在进行中..."); return
+        def _pick_src(self, mode=None):
+            if mode=="zip": p = filedialog.askopenfilename(title="选ZIP", filetypes=[("ZIP","*.zip")])
+            elif mode=="dir": p = filedialog.askdirectory(title="选文件夹")
+            elif mode=="file": p = filedialog.askopenfilename(title="选文件", filetypes=[("数据","*.xls;*.txt")])
+            else: p = filedialog.askopenfilename(title="选数据源", filetypes=[("支持","*.zip;*.xls;*.txt")]) or filedialog.askdirectory(title="或选文件夹")
+            if p: self.src.set(p); self.status.set(f"已选: {os.path.basename(p)}")
 
-            self.is_running = True
-            self.run_btn.configure(text="⏳ 分析中...", state="disabled", bg=STYLE["text_secondary"])
-            self.progress_var.set(5)
-            self.status_text.set("正在解析数据文件...")
-            self._clear_results()
-            threading.Thread(target=self._run_thread, args=(source,), daemon=True).start()
+        def _pick_out(self):
+            p = filedialog.askdirectory(title="输出目录", initialdir=self.out.get())
+            if p: self.out.set(p)
 
-        def _run_thread(self, source):
+        def _start(self):
+            s = self.src.get().strip()
+            if not s: messagebox.showwarning("提示","请先选择数据源"); return
+            if not os.path.exists(s): messagebox.showerror("错误","路径不存在"); return
+            if self.running: return
+            self.running = True
+            self.btn.configure(text="⏳ 分析中...", state="disabled", bg=STYLE["text_secondary"])
+            self.prog.set(5); self.status.set("解析中..."); self._clear()
+            threading.Thread(target=self._run, args=(s,), daemon=True).start()
+
+        def _run(self, s):
             try:
-                self.root.after(0, lambda: self.progress_var.set(10))
-                records, skipped = parse_source(source, progress_callback=lambda phase, detail:
-                    self.root.after(0, lambda: self.status_text.set(f"{phase}")))
-                if not records:
-                    msg = "未找到有效的测试记录。请确认文件包含 BLKVUN 开头的 SN。"
-                    if skipped:
-                        msg += f"\n跳过的文件: {len(skipped)} 个"
-                    raise ValueError(msg)
-                self.records = records
-                self.root.after(0, lambda: self.progress_var.set(40))
-                stations = sorted(set(r["file_source"] for r in records))
-                status = f"解析完成: {len(records)} 条, {len(stations)} 个站别"
+                self.root.after(0, lambda: self.prog.set(10))
+                recs, skipped, st_files = parse_source(s, cb=lambda ph,dt: self.root.after(0, lambda: self.status.set(ph)))
+                if not recs: raise ValueError("无有效记录")
+                self.records = recs
+                self.root.after(0, lambda: self.prog.set(40))
+                sinfo = " ".join(f"{st}({cnt})" for st,cnt in sorted(st_files.items()))
+                n_stations = len(st_files)
+                warn_msg = ""
+                if n_stations < 6:
+                    missing = [f"AT0{i}" for i in range(1,8) if f"AT0{i}" not in st_files]
+                    warn_msg = f" ⚠️ 仅检测到{n_stations}个站别，缺少: {', '.join(missing)}"
+                self.root.after(0, lambda: self.status.set(f"解析 {len(recs)}行 | 站别: {sinfo}{warn_msg}"))
+                if n_stations < 6:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", f"仅检测到 {n_stations} 个站别，请检查数据源是否完整。\n缺少: {', '.join(missing)}"))
                 if skipped:
-                    status += f"（跳过 {len(skipped)} 个文件）"
-                self.root.after(0, lambda: self.status_text.set(status))
-                analysis = analyze(records)
-                self.analysis_result = analysis
-                failure_analysis = analyze_failure_reasons(records, analysis)
-                self.root.after(0, lambda: self.progress_var.set(60))
-                self.root.after(0, lambda: self._show_results(analysis, failure_analysis))
-                out_dir = self.output_dir.get()
-                os.makedirs(out_dir, exist_ok=True)
+                    sk = "; ".join(skipped[:5])
+                    self.root.after(0, lambda: self.status.set(f"{self.status.get()} | 跳过: {sk}"))
+                a = analyze(recs); self.analysis = a
+                self.root.after(0, lambda: self.prog.set(60))
+                self.root.after(0, lambda: self._show(a))
+                od = self.out.get(); os.makedirs(od, exist_ok=True)
 
                 if self.opt_charts.get():
-                    self.root.after(0, lambda: self.progress_var.set(70))
-                    self.root.after(0, lambda: self.status_text.set("生成图表中..."))
+                    self.root.after(0, lambda: self.prog.set(70))
                     _get_font()
-                    _make_chart_overall_pie(analysis, os.path.join(out_dir, "chart_overall_pie.png"))
-                    _make_chart_station_bars(analysis, os.path.join(out_dir, "chart_station_bars.png"))
-                    _make_chart_hourly(analysis, os.path.join(out_dir, "chart_hourly_rate.png"))
-                    _make_chart_cycle_time(analysis, os.path.join(out_dir, "chart_cycle_time.png"))
-                    _make_chart_fail_dist(analysis, os.path.join(out_dir, "chart_fail_dist.png"))
-                    _make_chart_fail_matrix(analysis, os.path.join(out_dir, "chart_fail_matrix.png"))
-                    _make_chart_failure_reasons(failure_analysis, os.path.join(out_dir, "chart_failure_reasons.png"))
-
+                    chart_station_yield(a, os.path.join(od, "chart_station_yield.png"))
+                    chart_failure_reasons(a, os.path.join(od, "chart_failure_reasons.png"))
+                    chart_sn_fail_detail(a, os.path.join(od, "chart_sn_fail_detail.png"))
                 if self.opt_csv.get():
-                    self.root.after(0, lambda: self.progress_var.set(85))
-                    self.root.after(0, lambda: self.status_text.set("导出 CSV 中..."))
-                    self._write_csv(os.path.join(out_dir, "records_detail.csv"))
-
+                    self.root.after(0, lambda: self.prog.set(85))
+                    self._write_csv(os.path.join(od, "detail.csv"))
                 if self.opt_html.get():
-                    self.root.after(0, lambda: self.progress_var.set(95))
-                    self.root.after(0, lambda: self.status_text.set("生成 HTML 报告中..."))
-                    self.report_html_path = generate_html_report(analysis, failure_analysis, out_dir, os.path.join(out_dir, "report.html"))
-
-                self.root.after(0, lambda: self.progress_var.set(100))
-                self.root.after(0, lambda: self.status_text.set("✅ 分析完成！"))
-                self.root.after(0, self._on_done)
+                    self.root.after(0, lambda: self.prog.set(95))
+                    self.html_path = make_html(a, od, os.path.join(od, "report.html"), os.path.basename(s))
+                self.root.after(0, lambda: self.prog.set(100))
+                msg = f"✅ 完成！总数{a['total_sn']}台 PASS={a['pass_sn']} FAIL={a['fail_sn']} 良率{a['yield_rate']:.1f}%"
+                self.root.after(0, lambda: self.status.set(msg))
+                self.root.after(0, self._done)
             except Exception as e:
                 import traceback; traceback.print_exc()
-                self.root.after(0, lambda: self.status_text.set(f"❌ {str(e)[:80]}"))
-                self.root.after(0, lambda: self.progress_var.set(0))
-                self.root.after(0, self._on_error)
-                self.root.after(0, lambda: messagebox.showerror("分析失败", str(e)))
+                self.root.after(0, lambda: self.status.set(f"❌ {e}"))
+                self.root.after(0, lambda: self.prog.set(0))
+                self.root.after(0, self._err)
 
-        def _write_csv(self, path):
+        def _write_csv(self, p):
             if not self.records: return
-            keys = ["sn", "date", "fixture_id", "station", "project",
-                    "result", "error_code", "cycle_time", "product_info", "file_source"]
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
-                w.writeheader()
+            ks = ["sn","test_ch","test_name","display","result","value","station","time"]
+            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=ks, extrasaction="ignore"); w.writeheader()
                 for r in self.records:
-                    w.writerow({k: r.get(k, "") for k in keys})
+                    row = {k: r.get(k,"") for k in ks}
+                    if row.get("time"): row["time"] = str(row["time"])
+                    w.writerow(row)
 
-        def _show_results(self, a, fr=None):
-            self.cards["total"]["val"].configure(text=str(a["total"]))
-            self.cards["pass"]["val"].configure(text=str(a["pass"]))
-            self.cards["fail"]["val"].configure(text=str(a["fail"]))
-            self.cards["rate"]["val"].configure(text=f"{a['pass_rate']:.1f}%")
-            for item in self.station_tree.get_children():
-                self.station_tree.delete(item)
-            for st in sorted(a["by_station"].keys()):
-                d = a["by_station"][st]
-                total = d["total"]; rate = d["fail"] / total * 100 if total else 0
-                cts = d["cycle_times"]
-                avg_ct = f"{sum(cts)/len(cts):.1f}s" if cts else "-"
-                tag = "high_fail" if rate >= 15 else "mid_fail" if rate >= 5 else "low_fail"
-                self.station_tree.insert("", "end", values=(st, total, d["pass"], d["fail"], f"{rate:.1f}%", avg_ct), tags=(tag,))
-            for item in self.fail_tree.get_children():
-                self.fail_tree.delete(item)
-            for sn_info in a.get("multi_fail_sns", [])[:30]:
-                tag = "critical" if sn_info["fail_count"] >= 3 else ""
-                self.fail_tree.insert("", "end", values=(
-                    sn_info["sn"], sn_info["fail_count"], ", ".join(sn_info["stations_failed"]),
-                ), tags=(tag,) if tag else ())
-            if not a.get("multi_fail_sns"):
-                self.fail_tree.insert("", "end", values=("✅ 无跨站重复失败", "", ""))
+        def _show(self, a):
+            self.cards["total"]["v"].configure(text=str(a["total_sn"]))
+            self.cards["pass"]["v"].configure(text=str(a["pass_sn"]))
+            self.cards["fail"]["v"].configure(text=str(a["fail_sn"]))
+            self.cards["yield"]["v"].configure(text=f"{a['yield_rate']:.1f}%")
+            for t in [self.st_tree, self.fr_tree, self.sn_tree]:
+                for i in t.get_children(): t.delete(i)
+            # Clear all_sn sub-tabs
+            for st, (frame, tree) in list(self.all_trees.items()):
+                self.all_nb.forget(frame)
+            self.all_trees.clear()
+
+            # Station
+            for s in sorted(a["station_stats"].keys()):
+                d = a["station_stats"][s]
+                r = d["pass"]/d["total"]*100 if d["total"] else 0
+                tag = "good" if r>=97 else "warn" if r>=95 else "bad"
+                self.st_tree.insert("", "end", values=(s, d["total"], d["pass"], d["fail"], f"{r:.1f}%"), tags=(tag,))
+
             # Failure reasons
-            for item in self.reason_tree.get_children():
-                self.reason_tree.delete(item)
-            if fr:
-                for c in fr.get("categories", [])[:12]:
-                    pct = c["pct"]
-                    tag = "high" if pct > 30 else "mid" if pct > 15 else "low"
-                    self.reason_tree.insert("", "end", values=(
-                        c["name"], c["count"], f"{pct:.1f}%", c["detail"],
-                    ), tags=(tag,))
-            else:
-                self.reason_tree.insert("", "end", values=("—", "", "", ""))
+            total_fail = a["fail_sn"]
+            for reason, cnt in sorted(a["failure_counter"].items(), key=lambda x: -x[1]):
+                pct = cnt/total_fail*100 if total_fail else 0
+                self.fr_tree.insert("", "end", values=(reason, cnt, f"{pct:.1f}%"))
 
-        def _clear_results(self):
-            for k in self.cards:
-                self.cards[k]["val"].configure(text="—")
-            for tree in [self.station_tree, self.fail_tree, self.reason_tree]:
-                for item in tree.get_children():
-                    tree.delete(item)
-            self.report_html_path = None
-            for btn in [self.btn_report, self.btn_folder, self.btn_csv]:
-                btn.configure(state="disabled")
+            # Failed SNs
+            for s in a["fail_list"]:
+                items = ", ".join(s["failed"][:5])
+                self.sn_tree.insert("", "end", values=(s["sn"], s["station"], f"{len(s['failed'])}/{s['total']}", items))
 
-        def _on_done(self):
-            self.is_running = False
-            self.run_btn.configure(text="▶  重新分析", state="normal", bg=STYLE["accent"])
-            for btn in [self.btn_report, self.btn_folder, self.btn_csv]:
-                btn.configure(state="normal")
-            if self.opt_auto_open.get() and self.report_html_path:
-                self._open_report()
+            # All SNs by station
+            for st in sorted(a["all_sn_by_station"].keys()):
+                sns = sorted(a["all_sn_by_station"][st], key=lambda x: x["sn"])
+                frame = tk.Frame(self.all_nb, bg=STYLE["card_bg"])
+                tree = ttk.Treeview(frame, columns=("sn","result","fail_items"), show="headings", height=12)
+                tree.heading("sn", text="SN"); tree.column("sn", width=170)
+                tree.heading("result", text="结果"); tree.column("result", width=60, anchor="center")
+                tree.heading("fail_items", text="失败项"); tree.column("fail_items", width=400)
+                tree.pack(fill="both", expand=True)
+                tree.tag_configure("pass", foreground="#4CAF50")
+                tree.tag_configure("fail", foreground="#F44336")
+                for sn in sns:
+                    tag = "pass" if sn["passed"] else "fail"
+                    result = "✅ PASS" if sn["passed"] else "❌ FAIL"
+                    fails = ", ".join(sn["failed"][:5]) if sn["failed"] else ""
+                    tree.insert("", "end", values=(sn["sn"], result, fails), tags=(tag,))
+                self.all_nb.add(frame, text=f"{st}({len(sns)})")
+                self.all_trees[st] = (frame, tree)
 
-        def _on_error(self):
-            self.is_running = False
-            self.run_btn.configure(text="▶  开始分析", state="normal", bg=STYLE["accent"])
+        def _clear(self):
+            for k in self.cards: self.cards[k]["v"].configure(text="—")
+            for t in [self.st_tree, self.fr_tree, self.sn_tree]:
+                for i in t.get_children(): t.delete(i)
+            for st, (frame, tree) in list(self.all_trees.items()):
+                self.all_nb.forget(frame)
+            self.all_trees.clear()
+            self.html_path = None
+            self.br.configure(state="disabled"); self.bf.configure(state="disabled")
 
-        def _open_report(self):
-            if self.report_html_path and os.path.exists(self.report_html_path):
-                open_with_default(self.report_html_path)
-            else:
-                messagebox.showinfo("提示", "报告文件不存在，请先运行分析。")
+        def _done(self):
+            self.running = False
+            self.btn.configure(text="▶  重新分析", state="normal", bg=STYLE["accent"])
+            self.br.configure(state="normal"); self.bf.configure(state="normal")
+            if self.opt_open.get() and self.html_path: self._open_r()
 
-        def _open_folder(self):
-            out = self.output_dir.get()
-            if os.path.exists(out):
-                open_with_default(out)
-            else:
-                messagebox.showinfo("提示", "输出目录不存在。")
+        def _err(self):
+            self.running = False
+            self.btn.configure(text="▶  开始分析", state="normal", bg=STYLE["accent"])
 
-        def _save_csv(self):
-            if not self.records:
-                messagebox.showinfo("提示", "暂无分析数据。"); return
-            path = filedialog.asksaveasfilename(title="导出 CSV", defaultextension=".csv",
-                filetypes=[("CSV", "*.csv")], initialdir=self.output_dir.get(), initialfile="records_detail.csv")
-            if path:
-                self._write_csv(path)
-                self.status_text.set(f"CSV 已保存: {os.path.basename(path)}")
-                messagebox.showinfo("成功", f"已保存到:\n{path}")
+        def _open_r(self):
+            if self.html_path and os.path.exists(self.html_path): _open_with_default(self.html_path)
+            else: messagebox.showinfo("提示","报告不存在")
+
+        def _open_f(self):
+            o = self.out.get()
+            if os.path.exists(o): _open_with_default(o)
+            else: messagebox.showinfo("提示","目录不存在")
 
     root = tk.Tk()
     try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-    App(root)
-    root.mainloop()
+        from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
+    except: pass
+    App(root); root.mainloop()
 
-
-def main():
-    _run_gui()
-
-
-if __name__ == "__main__":
-    main()
+def main(): _run_gui()
+if __name__ == "__main__": main()
