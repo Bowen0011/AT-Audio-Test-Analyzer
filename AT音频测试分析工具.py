@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AT Audio Test 数据分析工具 v4.0
+AT Audio Test 数据分析工具 v4.1
 ===============================
 支持 Format A (9行块) 和 Format B (行级40项) 两种日志格式。
 取每项最终结果判定SN良率。
 
-输出: 直观汇总 + 分站别统计 + 失败原因 + HTML报告 + 图表
+输出: 直观汇总 + 分站别统计 + 失败原因 + UPH分析 + HTML交互报告 + 图表
 - 自动识别编码（GBK/UTF-8等），不依赖SN前缀
 - 按SN去重取各项最终结果，精准判定良率
+- HTML报告使用Chart.js交互图表（无需外部PNG），支持阴影/悬浮效果
+- 新增UPH（Units Per Hour）分析：整体+分站别+每小时分布
 - 颜色阈值: ≥97%绿 / 95-97%黄 / <95%红
 """
 
-import os, sys, csv, zipfile, threading, datetime, warnings, webbrowser, subprocess
+import os, sys, csv, json, zipfile, threading, datetime, warnings, webbrowser, subprocess
 from pathlib import Path
 from collections import defaultdict, Counter
 from tempfile import TemporaryDirectory
@@ -156,6 +158,12 @@ def analyze(records):
     for r in records:
         sn_data[r["sn"]].append(r)
 
+    # 跟踪每个站别的时间范围（用于UPH计算）
+    station_times = defaultdict(list)  # st -> [time, ...]
+    for r in records:
+        if r.get("time"):
+            station_times[r["station"]].append(r["time"])
+
     # 每个SN: 按 (test_ch, test_name) 分组，取最终结果
     sn_results = {}   # sn -> {station, passed: bool, failed_items: [display], total_items: int}
     station_stats = defaultdict(lambda: {"total":0, "pass":0, "fail":0, "failed_sns":[]})
@@ -215,6 +223,48 @@ def analyze(records):
             "failed": v["failed_items"], "total": v["total_items"],
         })
 
+    # ═══ UPH 计算 ═══
+    uph_data = {}
+    # 整体UPH
+    all_times = [t for tl in station_times.values() for t in tl]
+    if all_times:
+        overall_hours = (max(all_times) - min(all_times)).total_seconds() / 3600
+        uph_data["overall"] = {
+            "total_sn": total_sn,
+            "hours": round(overall_hours, 2),
+            "uph": round(total_sn / overall_hours, 1) if overall_hours > 0 else 0,
+            "start": min(all_times).strftime("%H:%M"),
+            "end": max(all_times).strftime("%H:%M"),
+        }
+        # 每小时产出分布
+        hourly = defaultdict(int)
+        for t in all_times:
+            hourly[t.strftime("%H:00")] += 1
+        uph_data["hourly"] = dict(sorted(hourly.items()))
+    else:
+        uph_data["overall"] = {"total_sn": total_sn, "hours": 0, "uph": 0, "start": "-", "end": "-"}
+        uph_data["hourly"] = {}
+
+    # 分站别UPH
+    uph_data["stations"] = {}
+    for st in sorted(station_stats.keys()):
+        times = station_times.get(st, [])
+        if times:
+            hours = (max(times) - min(times)).total_seconds() / 3600
+            sn_count = station_stats[st]["total"]
+            uph_data["stations"][st] = {
+                "sn": sn_count,
+                "hours": round(hours, 2),
+                "uph": round(sn_count / hours, 1) if hours > 0 else 0,
+                "start": min(times).strftime("%H:%M"),
+                "end": max(times).strftime("%H:%M"),
+            }
+        else:
+            uph_data["stations"][st] = {
+                "sn": station_stats[st]["total"], "hours": 0, "uph": 0,
+                "start": "-", "end": "-",
+            }
+
     return {
         "total_sn": total_sn,
         "pass_sn": pass_sn,
@@ -226,6 +276,7 @@ def analyze(records):
         "fail_list": fail_list,
         "all_sn_by_station": dict(all_sn_by_station),
         "total_raw_rows": len(records),
+        "uph": uph_data,
     }
 
 # ═══════════════════════════════════════════════
@@ -319,71 +370,394 @@ def chart_sn_fail_detail(a, out):
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 # ═══════════════════════════════════════════════
-# HTML
+# HTML (Chart.js 自包含交互报告)
 # ═══════════════════════════════════════════════
-_HTML = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+_HTML = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AT Audio Test 分析报告</title><style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f5f7fa;color:#333;padding:20px}}
-.container{{max-width:1200px;margin:0 auto}}
-h1{{text-align:center;color:#1a237e;margin-bottom:6px;font-size:26px}}
-.subtitle{{text-align:center;color:#78909c;margin-bottom:30px;font-size:13px}}
-.summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-bottom:30px}}
-.card{{background:white;border-radius:10px;padding:18px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-.card .v{{font-size:34px;font-weight:700}}.card .l{{font-size:12px;color:#78909c;margin-top:4px}}
-.card.g .v{{color:#4CAF50}}.card.r .v{{color:#F44336}}.card.b .v{{color:#2196F3}}.card.o .v{{color:#FF9800}}
-.sec{{background:white;border-radius:10px;padding:20px;margin-bottom:18px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-.sec h2{{color:#37474f;margin-bottom:15px;font-size:17px;border-left:4px solid #2196F3;padding-left:12px}}
-.sec img{{max-width:100%;height:auto;display:block;margin:0 auto}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th{{background:#263238;color:white;padding:9px 8px;text-align:left;font-weight:600}}
-td{{padding:7px 8px;border-bottom:1px solid #eceff1}}tr:hover td{{background:#f5f5f5}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;color:white}}
-.bg{{background:#4CAF50}}.br{{background:#F44336}}.bo{{background:#FF9800}}
+<title>AT Audio Test 分析报告</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js">
+</script><style>
+:root{--bg:#f0f2f5;--card:#fff;--fg:#1a1a2e;--accent:#2196F3;--green:#4CAF50;
+--red:#F44336;--orange:#FF9800;--muted:#78909c;--border:#e0e0e0}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"Microsoft YaHei","PingFang SC",sans-serif;
+background:var(--bg);color:var(--fg);padding:16px;line-height:1.5}
+.container{max-width:1280px;margin:0 auto}
+h1{text-align:center;color:#1a237e;font-size:26px;margin-bottom:4px;letter-spacing:1px}
+.subtitle{text-align:center;color:var(--muted);font-size:12px;margin-bottom:24px}
+/* 卡片 */
+.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.card{background:var(--card);border-radius:12px;padding:16px 14px;text-align:center;
+box-shadow:0 2px 12px rgba(0,0,0,0.06);transition:transform .2s,box-shadow .2s;cursor:default}
+.card:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,0,0,0.12)}
+.card .v{font-size:32px;font-weight:800;letter-spacing:-1px}
+.card .l{font-size:11px;color:var(--muted);margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
+.card.g .v{color:var(--green)}.card.r .v{color:var(--red)}
+.card.b .v{color:var(--accent)}.card.o .v{color:var(--orange)}
+.card .sub{font-size:11px;color:var(--muted);margin-top:3px}
+/* 区块 */
+.sec{background:var(--card);border-radius:12px;padding:20px;margin-bottom:16px;
+box-shadow:0 2px 12px rgba(0,0,0,0.06)}
+.sec h2{color:#37474f;font-size:16px;margin-bottom:14px;border-left:4px solid var(--accent);
+padding-left:10px;display:flex;align-items:center;gap:8px}
+.sec .chart-wrap{position:relative;width:100%;max-height:420px}
+.sec .chart-wrap canvas{width:100%!important}
+/* 表格 */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{background:#263238;color:#fff;padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid #eceff1}
+tr:hover td{background:#f5f7fa}
+tr.clickable{cursor:pointer}
+.badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:11px;font-weight:700;color:#fff}
+.bg{background:var(--green)}.br{background:var(--red)}.bo{background:var(--orange)}
+code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:11px}
+/* UPH 特殊样式 */
+.uph-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:14px}
+.uph-card{background:#f8faff;border:1px solid #e3edf7;border-radius:10px;padding:12px 16px}
+.uph-card .st{font-weight:700;color:var(--accent);font-size:13px}
+.uph-card .val{font-size:20px;font-weight:800;color:#0d47a1;margin:4px 0}
+.uph-card .detail{font-size:11px;color:var(--muted)}
+/* 响应式 */
+@media(max-width:768px){.summary{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><div class="container">
 <h1>🔊 AT Audio Test 分析报告</h1>
-<p class="subtitle">{report_time} | 数据: {source_info} | 每SN取各项最终结果</p>
+<p class="subtitle">$REPORT_TIME$ | 数据源: $SOURCE_INFO$ | 按SN去重取各项最终结果</p>
+
+<!-- ═══ 总览卡片 ═══ -->
 <div class="summary">
-<div class="card b"><div class="v">{total_sn}</div><div class="l">测试总数(台)</div></div>
-<div class="card g"><div class="v">{pass_sn}</div><div class="l">PASS</div></div>
-<div class="card r"><div class="v">{fail_sn}</div><div class="l">FAIL</div></div>
-<div class="card {yc}"><div class="v">{yield_rate:.1f}%</div><div class="l">良率</div></div>
+<div class="card b"><div class="v">$TOTAL_SN$</div><div class="l">测试总数(台)</div></div>
+<div class="card g"><div class="v">$PASS_SN$</div><div class="l">PASS</div></div>
+<div class="card r"><div class="v">$FAIL_SN$</div><div class="l">FAIL</div></div>
+<div class="card $YIELD_CLASS$"><div class="v">$YIELD_RATE$%</div><div class="l">良率</div></div>
+<div class="card b"><div class="v">$UPH_VALUE$</div><div class="l">整体UPH(台/时)</div><div class="sub">$UPH_HOURS$h · $UPH_START$~$UPH_END$</div></div>
 </div>
-<div class="sec"><h2>📊 各站别良率</h2><img src="chart_station_yield.png"></div>
-<div class="sec"><h2>📋 各站别统计</h2><table>
-<tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th></tr>{station_table}</table></div>
-<div class="sec"><h2>📊 失败原因</h2><img src="chart_failure_reasons.png"></div>
-<div class="sec"><h2>📊 各站别高频失败项</h2><img src="chart_sn_fail_detail.png"></div>
-<div class="sec"><h2>🔴 失败SN明细</h2><table>
-<tr><th>SN</th><th>站别</th><th>失败项数</th><th>失败测试项</th></tr>{sn_table}</table></div>
-</div></body></html>"""
+
+<!-- ═══ UPH 分站别 ═══ -->
+<div class="sec"><h2>⚡ 分站别 UPH (Units Per Hour)</h2>
+<div class="uph-row" id="uphCards">$UPH_CARDS$</div>
+<div class="chart-wrap"><canvas id="chartUphStations"></canvas></div></div>
+
+<!-- ═══ 各站别良率 ═══ -->
+<div class="sec"><h2>📊 各站别良率</h2>
+<div class="chart-wrap"><canvas id="chartStationYield"></canvas></div></div>
+
+<!-- ═══ 各站别统计表 ═══ -->
+<div class="sec"><h2>📋 各站别统计</h2><div class="tbl-wrap"><table>
+<tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th><th>UPH</th><th>时间范围</th></tr>
+$STATION_TABLE_ROWS$</table></div></div>
+
+<!-- ═══ UPH 每小时分布 ═══ -->
+$UPH_HOURLY_SECTION$
+
+<!-- ═══ 失败原因 ═══ -->
+<div class="sec"><h2>🔍 失败原因分布 (按SN去重)</h2>
+<div class="chart-wrap"><canvas id="chartFailureReasons"></canvas></div></div>
+
+<!-- ═══ 各站别高频失败项 ═══ -->
+<div class="sec"><h2>📊 各站别 Top3 高频失败项</h2>
+<div class="chart-wrap"><canvas id="chartSnFailDetail"></canvas></div></div>
+
+<!-- ═══ 失败SN明细 ═══ -->
+<div class="sec"><h2>🔴 失败SN明细</h2><div class="tbl-wrap"><table>
+<tr><th>SN</th><th>站别</th><th>失败项数</th><th>失败测试项</th></tr>
+$SN_TABLE_ROWS$</table></div></div>
+
+</div>
+
+<script>
+// ═══ Chart.js 阴影插件 ═══
+const shadowPlugin = {
+  id: 'shadow',
+  beforeDatasetsDraw(chart) {
+    const {ctx} = chart;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.15)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetX = 2;
+    ctx.shadowOffsetY = 3;
+  },
+  afterDatasetsDraw(chart) {
+    chart.ctx.restore();
+  }
+};
+
+// 通用配置
+Chart.defaults.font.family = '-apple-system,"Microsoft YaHei",sans-serif';
+Chart.defaults.plugins.tooltip.backgroundColor = 'rgba(30,30,30,0.9)';
+Chart.defaults.plugins.tooltip.titleFont = {size:13,weight:'bold'};
+Chart.defaults.plugins.tooltip.bodyFont = {size:12};
+Chart.defaults.plugins.tooltip.padding = 12;
+Chart.defaults.plugins.tooltip.cornerRadius = 8;
+
+const barOptions = {
+  responsive:true, maintainAspectRatio:false,
+  plugins: {legend:{display:false}},
+  scales: {y:{beginAtZero:true,grid:{color:'#e8e8e8'},ticks:{font:{size:11}}},
+           x:{grid:{display:false},ticks:{font:{size:11,weight:'bold'}}}},
+};
+
+// ═══ 各站别良率 ═══
+(function(){
+  const d = $CHART_STATION_YIELD$;
+  const ctx = document.getElementById('chartStationYield').getContext('2d');
+  new Chart(ctx, {
+    type:'bar', plugins:[shadowPlugin],
+    data:{
+      labels: d.labels,
+      datasets:[{
+        data: d.data,
+        backgroundColor: d.colors,
+        borderColor: 'rgba(0,0,0,0.06)',
+        borderWidth:1, borderRadius:8, borderSkipped:false,
+      }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{
+        legend:{display:false},
+        tooltip:{callbacks:{label:ctx=>ctx.raw.toFixed(1)+'% ('+d.totals[ctx.dataIndex]+'台)'}}
+      },
+      scales:{
+        y:{beginAtZero:false,min:Math.max(0,Math.min(...d.data)-8),max:102,
+           grid:{color:'#e8e8e8'},ticks:{callback:v=>v+'%',font:{size:11}}},
+        x:{grid:{display:false},ticks:{font:{size:12,weight:'bold'}}}
+      }
+    }
+  });
+})();
+
+// ═══ 失败原因分布 ═══
+$CHART_FAILURE_REASONS_BLOCK$
+
+// ═══ 各站别 Top3 高频失败项 ═══
+$CHART_SN_FAIL_DETAIL_BLOCK$
+
+// ═══ UPH 分站别 ═══
+$CHART_UPH_STATIONS_BLOCK$
+
+// ═══ UPH 每小时分布 ═══
+$CHART_UPH_HOURLY_BLOCK$
+</script></body></html>"""
+
+def _build_failure_reasons_chart_js(a):
+    """生成失败原因图表的 JavaScript"""
+    fc = a.get("failure_counter", {})
+    if not fc:
+        return "// 无失败数据"
+    items = sorted(fc.items(), key=lambda x: -x[1])[:12]
+    labels = [k[:28] for k, _ in items]
+    data = [v for _, v in items]
+    return f"""(function(){{
+  const d = {{labels:{json.dumps(labels)},data:{json.dumps(data)}}};
+  if(!d.labels.length) return;
+  const ctx = document.getElementById('chartFailureReasons').getContext('2d');
+  new Chart(ctx, {{
+    type:'bar', plugins:[shadowPlugin], options:{{indexAxis:'y',...barOptions}},
+    data:{{
+      labels: d.labels,
+      datasets:[{{
+        data: d.data,
+        backgroundColor: d.data.map((_,i)=>['#F44336','#E53935','#EF5350','#E57373','#EF9A9A','#FFCDD2','#FF8A80','#FF5252','#D32F2F','#C62828','#B71C1C','#F44336'][i]),
+        borderColor:'rgba(0,0,0,0.04)',borderWidth:1,borderRadius:6,
+      }}]
+    }}
+  }});
+}})();"""
+
+def _build_sn_fail_detail_chart_js(a):
+    """生成各站别Top3高频失败项的 JavaScript"""
+    ss = a.get("station_stats", {})
+    if not ss:
+        return "// 无失败数据"
+    stations = sorted(ss.keys())
+    colors = ["#E53935", "#FB8C00", "#1E88E5"]
+    datasets = []
+    for pos, color in enumerate(colors):
+        vals = []
+        for st in stations:
+            counter = Counter()
+            for sn_info in ss[st].get("failed_sns", []):
+                for item in sn_info["failed"]:
+                    counter[item] += 1
+            items = counter.most_common(3)
+            vals.append(items[pos][1] if pos < len(items) else 0)
+        datasets.append({
+            "label": ["#1最多", "#2", "#3"][pos],
+            "data": vals,
+            "backgroundColor": color,
+            "borderColor": "rgba(255,255,255,0.6)",
+            "borderWidth": 1,
+            "borderRadius": 5,
+        })
+
+    return f"""(function(){{
+  const datasets = {json.dumps(datasets)};
+  const labels = {json.dumps(stations)};
+  if(!labels.length) return;
+  const ctx = document.getElementById('chartSnFailDetail').getContext('2d');
+  new Chart(ctx, {{
+    type:'bar', plugins:[shadowPlugin],
+    data:{{labels, datasets}},
+    options:{{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{legend:{{position:'top',labels:{{font:{{size:10}},padding:15,usePointStyle:true}}}}}},
+      scales:{{
+        y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}},stepSize:1}}}},
+        x:{{grid:{{display:false}},ticks:{{font:{{size:12,weight:'bold'}}}}}}
+      }}
+    }}
+  }});
+}})();"""
+
+def _build_uph_stations_chart_js(a):
+    """生成分站别UPH图表 JavaScript"""
+    uph = a.get("uph", {}).get("stations", {})
+    if not uph:
+        return "// 无UPH数据"
+    stations = sorted(uph.keys())
+    data = [uph[s]["uph"] for s in stations]
+    labels_extra = [f"{uph[s]['sn']}台 / {uph[s]['hours']}h" for s in stations]
+    return f"""(function(){{
+  const labels = {json.dumps(stations)};
+  const data = {json.dumps(data)};
+  const extras = {json.dumps(labels_extra)};
+  if(!labels.length) return;
+  const ctx = document.getElementById('chartUphStations').getContext('2d');
+  new Chart(ctx, {{
+    type:'bar', plugins:[shadowPlugin],
+    data:{{
+      labels,
+      datasets:[{{
+        label:'UPH (台/小时)',
+        data,
+        backgroundColor: data.map(v=>v>=45?'#4CAF50':v>=35?'#FF9800':'#F44336'),
+        borderColor:'rgba(0,0,0,0.05)',borderWidth:1,borderRadius:8,borderSkipped:false,
+      }}]
+    }},
+    options:{{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{
+        legend:{{display:false}},
+        tooltip:{{callbacks:{{label:ctx=>ctx.raw+' 台/时 ('+extras[ctx.dataIndex]+')'}}}}
+      }},
+      scales:{{
+        y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}},callback:v=>v+' 台/时'}}}},
+        x:{{grid:{{display:false}},ticks:{{font:{{size:12,weight:'bold'}}}}}}
+      }}
+    }}
+  }});
+}})();"""
+
+def _build_uph_hourly_section(a):
+    """生成UPH每小时分布区块和图表"""
+    uph = a.get("uph", {})
+    hourly = uph.get("hourly", {})
+    if not hourly or len(hourly) < 2:
+        return ""
+    labels = list(hourly.keys())
+    data = list(hourly.values())
+    return f"""<div class="sec"><h2>⏱️ 每小时产出分布</h2>
+<div class="chart-wrap"><canvas id="chartUphHourly"></canvas></div></div>
+<script>
+(function(){{
+  new Chart(document.getElementById('chartUphHourly').getContext('2d'), {{
+    type:'line',
+    data:{{
+      labels: {json.dumps(labels)},
+      datasets:[{{
+        label:'测试数(条)',
+        data: {json.dumps(data)},
+        borderColor:'#2196F3',backgroundColor:'rgba(33,150,243,0.08)',
+        fill:true,tension:0.3,pointRadius:5,pointHoverRadius:8,
+        pointBackgroundColor:'#2196F3',borderWidth:2.5,
+      }}]
+    }},
+    options:{{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{{legend:{{display:false}}}},
+      scales:{{
+        y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}}}}}},
+        x:{{grid:{{display:false}},ticks:{{font:{{size:11}}}}}}
+      }}
+    }}
+  }});
+}})();
+</script>"""
 
 def make_html(a, out_dir, out_path, source_info=""):
-    # Station table
+    """生成自包含 HTML 报告（Chart.js 图表，无需外部PNG）"""
+    # Station table rows
     st_rows = []
+    uph = a.get("uph", {}).get("stations", {})
     for s in sorted(a["station_stats"].keys()):
         d = a["station_stats"][s]
         r = d["pass"]/d["total"]*100 if d["total"] else 0
         cls = "bg" if r>=97 else "bo" if r>=95 else "br"
-        st_rows.append(f"<tr><td><strong>{s}</strong></td><td>{d['total']}</td>"
-                       f"<td>{d['pass']}</td><td>{d['fail']}</td><td><span class='badge {cls}'>{r:.1f}%</span></td></tr>")
-    # SN table
+        su = uph.get(s, {})
+        st_rows.append(
+            f"<tr><td><strong>{s}</strong></td><td>{d['total']}</td>"
+            f"<td>{d['pass']}</td><td>{d['fail']}</td>"
+            f"<td><span class='badge {cls}'>{r:.1f}%</span></td>"
+            f"<td>{su.get('uph','-')}</td><td style='font-size:11px;color:var(--muted)'>{su.get('start','-')}~{su.get('end','-')}</td></tr>"
+        )
+
+    # SN table rows
     sn_rows = []
     for s in a["fail_list"]:
         items = ", ".join(s["failed"][:5])
-        sn_rows.append(f"<tr><td><code>{s['sn']}</code></td><td>{s['station']}</td>"
-                       f"<td>{len(s['failed'])}/{s['total']}</td><td style='font-size:11px'>{items}</td></tr>")
+        sn_rows.append(
+            f"<tr><td><code>{s['sn']}</code></td><td>{s['station']}</td>"
+            f"<td>{len(s['failed'])}/{s['total']}</td><td style='font-size:11px'>{items}</td></tr>"
+        )
+
+    # UPH cards
+    uph_cards = []
+    for st in sorted(uph.keys()):
+        su = uph[st]
+        uph_cards.append(
+            f"<div class='uph-card'><div class='st'>{st}</div>"
+            f"<div class='val'>{su['uph']} <span style='font-size:12px;font-weight:400;color:var(--muted)'>台/时</span></div>"
+            f"<div class='detail'>{su['sn']}台 · {su['hours']}h · {su['start']}~{su['end']}</div></div>"
+        )
 
     yc = "g" if a["yield_rate"]>=97 else "o" if a["yield_rate"]>=95 else "r"
-    html = _HTML.format(
-        report_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        source_info=source_info,
-        total_sn=a["total_sn"], pass_sn=a["pass_sn"], fail_sn=a["fail_sn"],
-        yield_rate=a["yield_rate"], yc=yc,
-        station_table="".join(st_rows), sn_table="".join(sn_rows),
-    )
-    with open(out_path, "w", encoding="utf-8") as f: f.write(html)
+
+    # Station yield chart data
+    sts = sorted(a["station_stats"].keys())
+    sy_data = [a["station_stats"][s]["pass"]/a["station_stats"][s]["total"]*100 for s in sts]
+    sy_colors = ["#4CAF50" if y>=97 else "#FF9800" if y>=95 else "#F44336" for y in sy_data]
+    sy_totals = [a["station_stats"][s]["total"] for s in sts]
+    station_yield_json = json.dumps({"labels": sts, "data": sy_data, "colors": sy_colors, "totals": sy_totals})
+
+    # UPH overall
+    uo = a.get("uph", {}).get("overall", {})
+
+    # Build
+    html = _HTML
+    html = html.replace("$REPORT_TIME$", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    html = html.replace("$SOURCE_INFO$", source_info or "-")
+    html = html.replace("$TOTAL_SN$", str(a["total_sn"]))
+    html = html.replace("$PASS_SN$", str(a["pass_sn"]))
+    html = html.replace("$FAIL_SN$", str(a["fail_sn"]))
+    html = html.replace("$YIELD_RATE$", f"{a['yield_rate']:.1f}")
+    html = html.replace("$YIELD_CLASS$", yc)
+    html = html.replace("$UPH_VALUE$", str(uo.get("uph", "-")))
+    html = html.replace("$UPH_HOURS$", str(uo.get("hours", "-")))
+    html = html.replace("$UPH_START$", str(uo.get("start", "-")))
+    html = html.replace("$UPH_END$", str(uo.get("end", "-")))
+    html = html.replace("$UPH_CARDS$", "".join(uph_cards))
+    html = html.replace("$STATION_TABLE_ROWS$", "".join(st_rows))
+    html = html.replace("$SN_TABLE_ROWS$", "".join(sn_rows) if sn_rows else "<tr><td colspan='4' style='text-align:center;color:var(--green)'>✅ 全部通过！</td></tr>")
+    html = html.replace("$CHART_STATION_YIELD$", station_yield_json)
+    html = html.replace("$CHART_FAILURE_REASONS_BLOCK$", _build_failure_reasons_chart_js(a))
+    html = html.replace("$CHART_SN_FAIL_DETAIL_BLOCK$", _build_sn_fail_detail_chart_js(a))
+    html = html.replace("$CHART_UPH_STATIONS_BLOCK$", _build_uph_stations_chart_js(a))
+    html = html.replace("$UPH_HOURLY_SECTION$", _build_uph_hourly_section(a))
+    html = html.replace("$CHART_UPH_HOURLY_BLOCK$", "")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
     return out_path
 
 # ═══════════════════════════════════════════════
@@ -404,7 +778,7 @@ def _run_gui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("AT Audio Test 分析工具 v3.2")
+            root.title("AT Audio Test 分析工具 v4.1")
             root.geometry("1050x700"); root.minsize(850,550)
             root.configure(bg=STYLE["bg"])
             self.src = tk.StringVar()
@@ -426,7 +800,7 @@ def _run_gui():
             # Header
             hdr = tk.Frame(self.root, bg=STYLE["accent"], height=48)
             hdr.pack(fill="x"); hdr.pack_propagate(False)
-            tk.Label(hdr, text="🔊 AT Audio Test 分析工具 v3.2", bg=STYLE["accent"], fg="white",
+            tk.Label(hdr, text="🔊 AT Audio Test 分析工具 v4.1", bg=STYLE["accent"], fg="white",
                      font=("Microsoft YaHei",15,"bold")).pack(side="left", padx=20, pady=10)
 
             main = tk.Frame(self.root, bg=STYLE["bg"])
@@ -478,7 +852,8 @@ def _run_gui():
             self.cards = {}
             for i,(k,label,color) in enumerate([
                 ("total","测试总数","#2196F3"),("pass","PASS","#4CAF50"),
-                ("fail","FAIL","#F44336"),("yield","良率","#FF9800")]):
+                ("fail","FAIL","#F44336"),("yield","良率","#FF9800"),
+                ("uph","UPH","#0D47A1")]):
                 cd = tk.Frame(cards, bg=STYLE["card_bg"], relief="solid", bd=1, padx=8, pady=8)
                 cd.grid(row=0, column=i, padx=3, sticky="nsew"); cards.grid_columnconfigure(i, weight=1)
                 self.cards[k] = {
@@ -585,6 +960,7 @@ def _run_gui():
                     sk = "; ".join(skipped[:5])
                     self.root.after(0, lambda: self.status.set(f"{self.status.get()} | 跳过: {sk}"))
                 a = analyze(recs); self.analysis = a
+                uo = a.get("uph", {}).get("overall", {})
                 self.root.after(0, lambda: self.prog.set(60))
                 self.root.after(0, lambda: self._show(a))
                 od = self.out.get(); os.makedirs(od, exist_ok=True)
@@ -602,7 +978,7 @@ def _run_gui():
                     self.root.after(0, lambda: self.prog.set(95))
                     self.html_path = make_html(a, od, os.path.join(od, "report.html"), os.path.basename(s))
                 self.root.after(0, lambda: self.prog.set(100))
-                msg = f"✅ 完成！总数{a['total_sn']}台 PASS={a['pass_sn']} FAIL={a['fail_sn']} 良率{a['yield_rate']:.1f}%"
+                msg = f"✅ 完成！总数{a['total_sn']}台 PASS={a['pass_sn']} FAIL={a['fail_sn']} 良率{a['yield_rate']:.1f}% UPH={uo.get('uph','-')}"
                 self.root.after(0, lambda: self.status.set(msg))
                 self.root.after(0, self._done)
             except Exception as e:
@@ -626,6 +1002,8 @@ def _run_gui():
             self.cards["pass"]["v"].configure(text=str(a["pass_sn"]))
             self.cards["fail"]["v"].configure(text=str(a["fail_sn"]))
             self.cards["yield"]["v"].configure(text=f"{a['yield_rate']:.1f}%")
+            uo = a.get("uph", {}).get("overall", {})
+            self.cards["uph"]["v"].configure(text=str(uo.get("uph", "-")))
             for t in [self.st_tree, self.fr_tree, self.sn_tree]:
                 for i in t.get_children(): t.delete(i)
             # Clear all_sn sub-tabs
