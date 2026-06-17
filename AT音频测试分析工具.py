@@ -236,11 +236,13 @@ def analyze(records):
             "start": min(all_times).strftime("%H:%M"),
             "end": max(all_times).strftime("%H:%M"),
         }
-        # 每小时产出分布
-        hourly = defaultdict(int)
-        for t in all_times:
-            hourly[t.strftime("%H:00")] += 1
-        uph_data["hourly"] = dict(sorted(hourly.items()))
+        # 每小时产出分布（按SN去重：每台设备每小时只计一次）
+        hourly_sn = defaultdict(int)
+        for sn, items in sn_data.items():
+            times_sorted = sorted(it["time"] for it in items if it.get("time"))
+            if times_sorted:
+                hourly_sn[times_sorted[0].strftime("%H:00")] += 1
+        uph_data["hourly"] = dict(sorted(hourly_sn.items()))
     else:
         uph_data["overall"] = {"total_sn": total_sn, "hours": 0, "uph": 0, "start": "-", "end": "-"}
         uph_data["hourly"] = {}
@@ -434,7 +436,7 @@ code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:11px}
 </div>
 
 <!-- ═══ UPH 分站别 ═══ -->
-<div class="sec"><h2>⚡ 分站别 UPH (Units Per Hour)</h2>
+<div class="sec"><h2>⚡ UPH 分析</h2>
 <div class="uph-row" id="uphCards">$UPH_CARDS$</div>
 <div class="chart-wrap"><canvas id="chartUphStations"></canvas></div></div>
 
@@ -446,9 +448,6 @@ code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:11px}
 <div class="sec"><h2>📋 各站别统计</h2><div class="tbl-wrap"><table>
 <tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th><th>UPH</th><th>时间范围</th></tr>
 $STATION_TABLE_ROWS$</table></div></div>
-
-<!-- ═══ UPH 每小时分布 ═══ -->
-$UPH_HOURLY_SECTION$
 
 <!-- ═══ 失败原因 ═══ -->
 <div class="sec"><h2>🔍 失败原因分布 (按SN去重)</h2>
@@ -533,11 +532,8 @@ $CHART_FAILURE_REASONS_BLOCK$
 // ═══ 各站别 Top3 高频失败项 ═══
 $CHART_SN_FAIL_DETAIL_BLOCK$
 
-// ═══ UPH 分站别 ═══
+// ═══ UPH 分时段 ═══
 $CHART_UPH_STATIONS_BLOCK$
-
-// ═══ UPH 每小时分布 ═══
-$CHART_UPH_HOURLY_BLOCK$
 </script></body></html>"""
 
 def _build_failure_reasons_chart_js(a):
@@ -566,7 +562,7 @@ def _build_failure_reasons_chart_js(a):
 }})();"""
 
 def _build_sn_fail_detail_chart_js(a):
-    """生成各站别Top3高频失败项的 JavaScript"""
+    """生成各站别Top3高频失败项的 JavaScript（带失败原因标注）"""
     ss = a.get("station_stats", {})
     if not ss:
         return "// 无失败数据"
@@ -575,13 +571,19 @@ def _build_sn_fail_detail_chart_js(a):
     datasets = []
     for pos, color in enumerate(colors):
         vals = []
+        lbls = []
         for st in stations:
             counter = Counter()
             for sn_info in ss[st].get("failed_sns", []):
                 for item in sn_info["failed"]:
                     counter[item] += 1
             items = counter.most_common(3)
-            vals.append(items[pos][1] if pos < len(items) else 0)
+            if pos < len(items):
+                vals.append(items[pos][1])
+                lbls.append(items[pos][0][:14])
+            else:
+                vals.append(0)
+                lbls.append("")
         datasets.append({
             "label": ["#1最多", "#2", "#3"][pos],
             "data": vals,
@@ -589,18 +591,45 @@ def _build_sn_fail_detail_chart_js(a):
             "borderColor": "rgba(255,255,255,0.6)",
             "borderWidth": 1,
             "borderRadius": 5,
+            "itemLabels": lbls,  # 失败原因名称
         })
 
     return f"""(function(){{
   const datasets = {json.dumps(datasets)};
   const labels = {json.dumps(stations)};
   if(!labels.length) return;
+
+  // 柱状图标签插件
+  const barLabelPlugin = {{
+    id: 'barLabels',
+    afterDatasetsDraw(chart) {{
+      const ctx = chart.ctx;
+      chart.data.datasets.forEach((ds, di) => {{
+        const meta = chart.getDatasetMeta(di);
+        if(!meta) return;
+        meta.data.forEach((bar, i) => {{
+          const label = ds.itemLabels ? ds.itemLabels[i] : '';
+          if(!label || ds.data[i] === 0) return;
+          ctx.save();
+          ctx.fillStyle = '#333';
+          ctx.font = 'bold 8px -apple-system,"Microsoft YaHei",sans-serif';
+          ctx.textAlign = 'center';
+          ctx.translate(bar.x, bar.y - 6);
+          ctx.rotate(-0.7);
+          ctx.fillText(label, 0, 0);
+          ctx.restore();
+        }});
+      }});
+    }}
+  }};
+
   const ctx = document.getElementById('chartSnFailDetail').getContext('2d');
   new Chart(ctx, {{
-    type:'bar', plugins:[shadowPlugin],
+    type:'bar', plugins:[shadowPlugin, barLabelPlugin],
     data:{{labels, datasets}},
     options:{{
       responsive:true, maintainAspectRatio:false,
+      layout:{{padding:{{top:45}}}},
       plugins:{{legend:{{position:'top',labels:{{font:{{size:10}},padding:15,usePointStyle:true}}}}}},
       scales:{{
         y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}},stepSize:1}}}},
@@ -611,17 +640,16 @@ def _build_sn_fail_detail_chart_js(a):
 }})();"""
 
 def _build_uph_stations_chart_js(a):
-    """生成分站别UPH图表 JavaScript"""
-    uph = a.get("uph", {}).get("stations", {})
-    if not uph:
+    """生成总体UPH分时段图表（每小时实际测试产品数量总数）"""
+    hourly = a.get("uph", {}).get("hourly", {})
+    if not hourly:
         return "// 无UPH数据"
-    stations = sorted(uph.keys())
-    data = [uph[s]["uph"] for s in stations]
-    labels_extra = [f"{uph[s]['sn']}台 / {uph[s]['hours']}h" for s in stations]
+    labels = list(hourly.keys())
+    data = list(hourly.values())
+    total = sum(data)
     return f"""(function(){{
-  const labels = {json.dumps(stations)};
+  const labels = {json.dumps(labels)};
   const data = {json.dumps(data)};
-  const extras = {json.dumps(labels_extra)};
   if(!labels.length) return;
   const ctx = document.getElementById('chartUphStations').getContext('2d');
   new Chart(ctx, {{
@@ -629,61 +657,25 @@ def _build_uph_stations_chart_js(a):
     data:{{
       labels,
       datasets:[{{
-        label:'UPH (台/小时)',
+        label:'测试台数',
         data,
-        backgroundColor: data.map(v=>v>=45?'#4CAF50':v>=35?'#FF9800':'#F44336'),
-        borderColor:'rgba(0,0,0,0.05)',borderWidth:1,borderRadius:8,borderSkipped:false,
+        backgroundColor: '#2196F3',
+        borderColor:'rgba(0,0,0,0.05)',borderWidth:1,borderRadius:6,
       }}]
     }},
     options:{{
       responsive:true, maintainAspectRatio:false,
       plugins:{{
         legend:{{display:false}},
-        tooltip:{{callbacks:{{label:ctx=>ctx.raw+' 台/时 ('+extras[ctx.dataIndex]+')'}}}}
+        tooltip:{{callbacks:{{label:ctx=>ctx.raw+' 台'}}}}
       }},
       scales:{{
-        y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}},callback:v=>v+' 台/时'}}}},
-        x:{{grid:{{display:false}},ticks:{{font:{{size:12,weight:'bold'}}}}}}
+        y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}},callback:v=>v+'台'}}}},
+        x:{{grid:{{display:false}},ticks:{{font:{{size:11,weight:'bold'}}}}}}
       }}
     }}
   }});
 }})();"""
-
-def _build_uph_hourly_section(a):
-    """生成UPH每小时分布区块和图表"""
-    uph = a.get("uph", {})
-    hourly = uph.get("hourly", {})
-    if not hourly or len(hourly) < 2:
-        return ""
-    labels = list(hourly.keys())
-    data = list(hourly.values())
-    return f"""<div class="sec"><h2>⏱️ 每小时产出分布</h2>
-<div class="chart-wrap"><canvas id="chartUphHourly"></canvas></div></div>
-<script>
-(function(){{
-  new Chart(document.getElementById('chartUphHourly').getContext('2d'), {{
-    type:'line',
-    data:{{
-      labels: {json.dumps(labels)},
-      datasets:[{{
-        label:'测试数(条)',
-        data: {json.dumps(data)},
-        borderColor:'#2196F3',backgroundColor:'rgba(33,150,243,0.08)',
-        fill:true,tension:0.3,pointRadius:5,pointHoverRadius:8,
-        pointBackgroundColor:'#2196F3',borderWidth:2.5,
-      }}]
-    }},
-    options:{{
-      responsive:true,maintainAspectRatio:false,
-      plugins:{{legend:{{display:false}}}},
-      scales:{{
-        y:{{beginAtZero:true,grid:{{color:'#e8e8e8'}},ticks:{{font:{{size:11}}}}}},
-        x:{{grid:{{display:false}},ticks:{{font:{{size:11}}}}}}
-      }}
-    }}
-  }});
-}})();
-</script>"""
 
 def make_html(a, out_dir, out_path, source_info=""):
     """生成自包含 HTML 报告（Chart.js 图表，无需外部PNG）"""
@@ -753,8 +745,6 @@ def make_html(a, out_dir, out_path, source_info=""):
     html = html.replace("$CHART_FAILURE_REASONS_BLOCK$", _build_failure_reasons_chart_js(a))
     html = html.replace("$CHART_SN_FAIL_DETAIL_BLOCK$", _build_sn_fail_detail_chart_js(a))
     html = html.replace("$CHART_UPH_STATIONS_BLOCK$", _build_uph_stations_chart_js(a))
-    html = html.replace("$UPH_HOURLY_SECTION$", _build_uph_hourly_section(a))
-    html = html.replace("$CHART_UPH_HOURLY_BLOCK$", "")
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
