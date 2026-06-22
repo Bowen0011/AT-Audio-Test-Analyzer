@@ -370,6 +370,165 @@ def chart_sn_fail_detail(a, out):
     ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.set_ylim(0, max_val*1.5)
     plt.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
+# ═══════════════════════════════════════════════
+# 多日对比分析 (7-Day Comparison)
+# ═══════════════════════════════════════════════
+
+def parse_multi_day_source(parent_dir, cb=None):
+    """解析包含多天数据的目录。
+    自动检测日期命名的子目录: parent_dir/2026-06-15/(数据文件) ..."""
+    import re
+    multi = {}
+    if not os.path.isdir(parent_dir):
+        return multi, "路径不是目录: " + parent_dir
+
+    date_dirs = []
+    for name in sorted(os.listdir(parent_dir)):
+        sub = os.path.join(parent_dir, name)
+        if os.path.isdir(sub) and re.match(r'\d{4}-\d{2}-\d{2}', name):
+            date_dirs.append((name, sub))
+
+    if not date_dirs:
+        return multi, "未找到日期命名的子目录(格式:YYYY-MM-DD)"
+
+    skipped_all = []
+    for date_str, sub_dir in date_dirs:
+        if cb: cb("解析 "+date_str+"...", sub_dir)
+        try:
+            recs, skipped, st_files = parse_source(sub_dir)
+            if recs:
+                a = analyze(recs)
+                multi[date_str] = {
+                    "records": recs, "analysis": a,
+                    "station_files": st_files, "skipped": skipped,
+                }
+            else:
+                skipped_all.append(date_str+": 无有效记录")
+        except Exception as e:
+            skipped_all.append(date_str+": "+str(e))
+
+    if not multi:
+        return {}, "; ".join(skipped_all) if skipped_all else "无有效数据"
+    return multi, "; ".join(skipped_all) if skipped_all else ""
+
+
+def build_compare_data(multi):
+    """从多日分析结果构建各站别对比数据。"""
+    if not multi:
+        return None
+
+    dates = sorted(multi.keys())
+    all_stations = set()
+    for d in dates:
+        all_stations.update(multi[d]["analysis"]["station_stats"].keys())
+    stations = sorted(all_stations)
+
+    compare = {"dates": dates, "stations": {}}
+    for st in stations:
+        st_data = []
+        for d in dates:
+            a = multi[d]["analysis"]
+            ss = a["station_stats"].get(st, {"total": 0, "pass": 0, "fail": 0})
+            total = ss["total"]
+            yld = ss["pass"] / total * 100 if total > 0 else 0
+            uph_info = a.get("uph", {}).get("stations", {}).get(st, {})
+            st_data.append({
+                "date": d, "total": total, "pass": ss["pass"],
+                "fail": ss["fail"], "yield": round(yld, 1),
+                "uph": uph_info.get("uph", 0),
+            })
+        compare["stations"][st] = st_data
+    return compare
+
+
+def _build_compare_chart_js(compare_data):
+    """生成7天对比图表的JavaScript（带站别切换按钮，默认显示AT1）"""
+    if not compare_data:
+        return "// 无对比数据"
+
+    dates = compare_data["dates"]
+    stations_data = compare_data["stations"]
+    stations = sorted(stations_data.keys())
+
+    if not stations:
+        return "// 无站别数据"
+
+    default_st = "AT01" if "AT01" in stations else stations[0]
+
+    js = []
+    js.append("(function() {")
+    js.append("var _cs = " + json.dumps(stations) + ";")
+    js.append("var _cd = " + json.dumps(dates) + ";")
+    js.append("var _cdata = " + json.dumps(stations_data) + ";")
+    js.append("var _cchart = null;")
+    js.append("var _cb = document.getElementById('compareBtns');")
+    js.append("if(_cb){")
+    js.append("  _cs.forEach(function(st,i){")
+    js.append("    var b = document.createElement('button');")
+    js.append("    b.textContent = st;")
+    js.append("    b.className = 'cmp-btn' + (st=='" + default_st + "' ? ' active' : '');")
+    js.append("    b.onclick = function(){")
+    js.append("      document.querySelectorAll('.cmp-btn').forEach(function(x){x.classList.remove('active');});")
+    js.append("      this.classList.add('active');")
+    js.append("      _updateCmp(st);")
+    js.append("    };")
+    js.append("    _cb.appendChild(b);")
+    js.append("  });")
+    js.append("}")
+    js.append("function _updateCmp(sn){")
+    js.append("  var sd = _cdata[sn]; if(!sd) return;")
+    js.append("  var ctx = document.getElementById('chartCompare').getContext('2d');")
+    js.append("  if(_cchart) _cchart.destroy();")
+    js.append("  var yy = sd.map(function(d){return d.yield;});")
+    js.append("  var tt = sd.map(function(d){return d.total;});")
+    js.append("  var cc = yy.map(function(y){return y>=97?'#4CAF50':y>=95?'#FF9800':'#F44336';});")
+    js.append("  _cchart = new Chart(ctx,{")
+    js.append("    type:'bar', plugins:[shadowPlugin],")
+    js.append("    data:{")
+    js.append("      labels: _cd,")
+    js.append("      datasets:[")
+    js.append("        {type:'bar', label:'测试数(台)', data:tt,")
+    js.append("         backgroundColor:'rgba(33,150,243,0.4)', borderColor:'#2196F3',")
+    js.append("         borderWidth:1.5, borderRadius:8, yAxisID:'y1', order:1},")
+    js.append("        {type:'line', label:'良率(%)', data:yy,")
+    js.append("         borderColor:'#FF6D00', backgroundColor:'#FF6D00',")
+    js.append("         borderWidth:3, pointRadius:7, pointBackgroundColor:cc,")
+    js.append("         pointBorderColor:'#fff', pointBorderWidth:2, pointHoverRadius:10,")
+    js.append("         tension:0.35, yAxisID:'y', order:0}")
+    js.append("      ]")
+    js.append("    },")
+    js.append("    options:{")
+    js.append("      responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},")
+    js.append("      plugins:{")
+    js.append("        legend:{position:'top',labels:{usePointStyle:true,padding:20,font:{size:11}}},")
+    js.append("        tooltip:{callbacks:{")
+    js.append("          label:function(ctx){")
+    js.append("            if(ctx.dataset.label.indexOf('良率')!==-1){")
+    js.append("              var d=sd[ctx.dataIndex];")
+    js.append("              return '良率: '+d.yield+'% ('+d.pass+'/'+d.total+'台)';")
+    js.append("            }")
+    js.append("            return '测试数: '+ctx.raw+' 台';")
+    js.append("          }}}")
+    js.append("      },")
+    js.append("      scales:{")
+    js.append("        y:{type:'linear',position:'left',")
+    js.append("           title:{display:true,text:'良率 (%)',font:{size:12,weight:'bold'}},")
+    js.append("           min:Math.max(0,Math.min.apply(null,yy)-10),max:105,")
+    js.append("           ticks:{callback:function(v){return v+'%';},font:{size:11}},")
+    js.append("           grid:{color:'#f0f0f0'}},")
+    js.append("        y1:{type:'linear',position:'right',")
+    js.append("            title:{display:true,text:'测试数 (台)',font:{size:12,weight:'bold'}},")
+    js.append("            beginAtZero:true, ticks:{font:{size:11}}, grid:{drawOnChartArea:false}},")
+    js.append("        x:{title:{display:true,text:'日期',font:{size:12,weight:'bold'}},")
+    js.append("           grid:{display:false}, ticks:{font:{size:12,weight:'bold'}}}")
+    js.append("      }")
+    js.append("    }")
+    js.append("  });")
+    js.append("}")
+    js.append("_updateCmp('" + default_st + "');")
+    js.append("})();")
+    return "\\n".join(js)
+
 
 # ═══════════════════════════════════════════════
 # HTML (Chart.js 自包含交互报告)
@@ -420,6 +579,13 @@ code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:11px}
 .uph-card .st{font-weight:700;color:var(--accent);font-size:13px}
 .uph-card .val{font-size:20px;font-weight:800;color:#0d47a1;margin:4px 0}
 .uph-card .detail{font-size:11px;color:var(--muted)}
+/* 7天对比切换按钮 */
+.cmp-btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.cmp-btn{padding:8px 18px;border:2px solid #e0e0e0;border-radius:8px;background:#fff;
+color:#546e7a;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s}
+.cmp-btn:hover{border-color:var(--accent);color:var(--accent)}
+.cmp-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+
 /* 响应式 */
 @media(max-width:768px){.summary{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><div class="container">
@@ -448,6 +614,13 @@ code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:11px}
 <div class="sec"><h2>📋 各站别统计</h2><div class="tbl-wrap"><table>
 <tr><th>站别</th><th>测试数</th><th>PASS</th><th>FAIL</th><th>良率</th><th>UPH</th><th>时间范围</th></tr>
 $STATION_TABLE_ROWS$</table></div></div>
+
+
+<!-- ═══ 7天对比 ═══ -->
+<div class="sec"><h2>📈 前7天数据对比</h2>
+<p style="font-size:12px;color:var(--muted);margin-bottom:10px">选择站别查看近7天良率与测试数趋势</p>
+<div class="cmp-btn-row" id="compareBtns"></div>
+<div class="chart-wrap" style="max-height:400px"><canvas id="chartCompare"></canvas></div></div>
 
 <!-- ═══ 失败原因 ═══ -->
 <div class="sec"><h2>🔍 失败原因分布 (按SN去重)</h2>
@@ -534,6 +707,7 @@ $CHART_SN_FAIL_DETAIL_BLOCK$
 
 // ═══ UPH 分时段 ═══
 $CHART_UPH_STATIONS_BLOCK$
+$CHART_COMPARE_BLOCK$
 </script></body></html>"""
 
 def _build_failure_reasons_chart_js(a):
@@ -677,7 +851,7 @@ def _build_uph_stations_chart_js(a):
   }});
 }})();"""
 
-def make_html(a, out_dir, out_path, source_info=""):
+def make_html(a, out_dir, out_path, source_info="", compare_data=None):
     """生成自包含 HTML 报告（Chart.js 图表，无需外部PNG）"""
     # Station table rows
     st_rows = []
@@ -745,6 +919,7 @@ def make_html(a, out_dir, out_path, source_info=""):
     html = html.replace("$CHART_FAILURE_REASONS_BLOCK$", _build_failure_reasons_chart_js(a))
     html = html.replace("$CHART_SN_FAIL_DETAIL_BLOCK$", _build_sn_fail_detail_chart_js(a))
     html = html.replace("$CHART_UPH_STATIONS_BLOCK$", _build_uph_stations_chart_js(a))
+    html = html.replace("$CHART_COMPARE_BLOCK$", _build_compare_chart_js(compare_data))
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -768,7 +943,7 @@ def _run_gui():
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("AT Audio Test 分析工具 v4.1")
+            root.title("AT Audio Test 分析工具 v4.2")
             root.geometry("1050x700"); root.minsize(850,550)
             root.configure(bg=STYLE["bg"])
             self.src = tk.StringVar()
@@ -779,6 +954,7 @@ def _run_gui():
             self.opt_html = tk.BooleanVar(value=True)
             self.opt_csv = tk.BooleanVar(value=True)
             self.opt_open = tk.BooleanVar(value=True)
+            self.opt_compare = tk.BooleanVar(value=False)
             self.records = None; self.analysis = None; self.html_path = None; self.running = False
             self._build()
             root.update_idletasks()
@@ -829,6 +1005,7 @@ def _run_gui():
                 tk.Checkbutton(f3, text=t, variable=v, bg=STYLE["card_bg"], font=("Microsoft YaHei",10),
                                activebackground=STYLE["card_bg"], selectcolor=STYLE["card_bg"]).pack(anchor="w", pady=1)
 
+            tk.Checkbutton(f3, text="📅 7天对比模式", variable=self.opt_compare, bg=STYLE["card_bg"], font=("Microsoft YaHei",10), activebackground=STYLE["card_bg"], selectcolor=STYLE["card_bg"]).pack(anchor="w", pady=1)
             # Run
             self.btn = tk.Button(left, text="▶  开始分析", command=self._start, bg=STYLE["accent"], fg="white",
                                   font=("Microsoft YaHei",12,"bold"), relief="flat", padx=30, pady=10, cursor="hand2")
@@ -928,7 +1105,10 @@ def _run_gui():
             self.running = True
             self.btn.configure(text="⏳ 分析中...", state="disabled", bg=STYLE["text_secondary"])
             self.prog.set(5); self.status.set("解析中..."); self._clear()
-            threading.Thread(target=self._run, args=(s,), daemon=True).start()
+            if self.opt_compare.get() and os.path.isdir(s):
+                threading.Thread(target=self._run_multi, args=(s,), daemon=True).start()
+            else:
+                threading.Thread(target=self._run, args=(s,), daemon=True).start()
 
         def _run(self, s):
             try:
@@ -969,6 +1149,56 @@ def _run_gui():
                     self.html_path = make_html(a, od, os.path.join(od, "report.html"), os.path.basename(s))
                 self.root.after(0, lambda: self.prog.set(100))
                 msg = f"✅ 完成！总数{a['total_sn']}台 PASS={a['pass_sn']} FAIL={a['fail_sn']} 良率{a['yield_rate']:.1f}% UPH={uo.get('uph','-')}"
+                self.root.after(0, lambda: self.status.set(msg))
+                self.root.after(0, self._done)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.root.after(0, lambda: self.status.set(f"❌ {e}"))
+                self.root.after(0, lambda: self.prog.set(0))
+                self.root.after(0, self._err)
+
+
+        def _run_multi(self, parent_dir):
+            """多日对比模式：解析父目录下各日期子目录"""
+            try:
+                self.root.after(0, lambda: self.prog.set(10))
+                multi, err = parse_multi_day_source(parent_dir,
+                    cb=lambda ph,dt: self.root.after(0, lambda: self.status.set(ph)))
+                if not multi:
+                    raise ValueError(err or "无有效数据")
+                dates = sorted(multi.keys())
+                total_sn = sum(m[d]["analysis"]["total_sn"] for d in dates)
+                self.root.after(0, lambda: self.prog.set(40))
+                sinfo = f"{len(dates)}天数据 ({dates[0]}~{dates[-1]})"
+                self.root.after(0, lambda: self.status.set(f"解析 {total_sn}台SN | {sinfo}"))
+                
+                # Use first day's analysis for the main report (single-day view)
+                first_date = dates[0]
+                a = multi[first_date]["analysis"]
+                self.records = multi[first_date]["records"]
+                self.analysis = a
+                
+                uo = a.get("uph", {}).get("overall", {})
+                self.root.after(0, lambda: self.prog.set(60))
+                self.root.after(0, lambda: self._show(a))
+                od = self.out.get(); os.makedirs(od, exist_ok=True)
+
+                if self.opt_charts.get():
+                    self.root.after(0, lambda: self.prog.set(70))
+                    _get_font()
+                    chart_station_yield(a, os.path.join(od, "chart_station_yield.png"))
+                    chart_failure_reasons(a, os.path.join(od, "chart_failure_reasons.png"))
+                    chart_sn_fail_detail(a, os.path.join(od, "chart_sn_fail_detail.png"))
+                if self.opt_csv.get():
+                    self.root.after(0, lambda: self.prog.set(85))
+                    self._write_csv(os.path.join(od, "detail.csv"))
+                if self.opt_html.get():
+                    self.root.after(0, lambda: self.prog.set(95))
+                    cmp = build_compare_data(multi)
+                    self.html_path = make_html(a, od, os.path.join(od, "report.html"),
+                                               os.path.basename(parent_dir), compare_data=cmp)
+                self.root.after(0, lambda: self.prog.set(100))
+                msg = f"✅ 完成！{len(dates)}天数据 总数{total_sn}台 良率{a['yield_rate']:.1f}% UPH={uo.get('uph','-')}"
                 self.root.after(0, lambda: self.status.set(msg))
                 self.root.after(0, self._done)
             except Exception as e:

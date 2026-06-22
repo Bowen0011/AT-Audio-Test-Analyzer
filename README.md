@@ -1,4 +1,4 @@
-# 🔊 AT Audio Test 数据分析工具 v4.1
+# 🔊 AT Audio Test 数据分析工具 v4.2
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -9,6 +9,13 @@
 > A single-file desktop GUI tool for AT production line log analysis. Deduplicates by SN (final result per test item), provides per-station yield + UPH breakdown, and generates self-contained interactive HTML reports.
 
 ---
+
+## 🆕 v4.2 更新
+
+- **📈 7天数据对比** — 新增多日对比模式，勾选后可解析父目录下各日期子目录
+- **🔘 站别切换图表** — HTML 报告中通过按钮切换各站别的7天趋势图（默认显示 AT1）
+- **📊 组合图表** — 柱状图显示每日测试数 + 折线显示良率趋势，双Y轴一目了然
+- **🎯 无色编码** — 折线数据点按良率自动着色（≥97%绿 / 95-97%黄 / <95%红）
 
 ## 🆕 v4.1 更新
 
@@ -26,6 +33,7 @@
 - 🔒 **加密兼容** — 公司加密 .xls 另存 .txt 即可分析
 - 🔄 **SN 去重** — 每 SN 每项测试取最终结果，杜绝虚高 FAIL
 - 📊 **5 标签页** — 站别统计 / 失败原因 / 失败SN / 全部SN(分站) + UPH 卡片
+- 🔘 **7天对比** — 勾选后支持多日数据对比，按钮切换站别趋势图，默认 AT1
 - 🧵 **后台线程** — 解析不冻结界面，实时进度条
 - 📄 **HTML 报告** — Chart.js 交互图表（自包含，无需外部文件），支持阴影/悬浮/失败原因标注
 - 📈 **PNG 图表** — 站别良率 / 失败原因 / 各站别Top3高频失败项
@@ -126,6 +134,12 @@ python at_analyzer.py
 ---
 
 ## 📝 Changelog
+
+### v4.2 (2026-06-22)
+- **7天数据对比**：勾选"📅 7天对比模式"，选择包含日期子目录的父文件夹
+- **站别切换图表**：HTML 报告自动生成切换按钮，点击不同站别查看趋势
+- **组合图表**：柱状图（测试数）+ 折线（良率），双 Y 轴，数据点自动着色
+- **目录结构**：parent/2026-06-15/…, parent/2026-06-16/… 自动识别
 
 ### v4.1 (2026-06-17)
 - **HTML 图表自包含**：改用 Chart.js 交互图表，不再依赖外部 PNG
